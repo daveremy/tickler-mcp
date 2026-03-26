@@ -1,6 +1,6 @@
 {
   "name": "@daveremy/tickler-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Persistent tickler/reminder MCP server for Claude Code and any MCP client",
   "type": "module",
   "license": "MIT",
@@ -21,8 +21,8 @@
     "url": "git+https://github.com/daveremy/tickler-mcp.git"
   },
   "bin": {
-    "tickler": "./dist/cli.js",
-    "tickler-mcp": "./dist/mcp.js"
+    "tickler": "dist/cli.js",
+    "tickler-mcp": "dist/mcp.js"
   },
   "files": [
     "dist",
