@@ -15,7 +15,7 @@ Use this skill to create, check, and manage ticklers: reminders that persist acr
 - `tickler_list` — List all ticklers, optionally filtered by status or tag
 - `tickler_complete` — Mark a tickler done
 - `tickler_delete` — Permanently remove a tickler
-- `tickler_snooze` — Push due date forward by N hours or days
+- `tickler_snooze` — Push due date forward by a duration string: "1d", "3h", "1w", "30m"
 
 ## Usage Patterns
 
@@ -33,7 +33,7 @@ tickler_create:
 ```
 
 ### Snoozing
-If the user isn't ready to act: `tickler_snooze` with `days: 3`.
+If the user isn't ready to act: `tickler_snooze` with `id` and `duration: "3d"`.
 
 ### Completing
 Once actioned: `tickler_complete` with the tickler ID.
@@ -41,7 +41,7 @@ Once actioned: `tickler_complete` with the tickler ID.
 ## Storage
 
 Default: `~/.tickler/ticklers.json`
-Override: set `TICKLER_STORAGE_PATH` env var before starting the MCP server.
+Override: set `TICKLER_PATH` env var before starting the MCP server.
 
 ## Notes
 

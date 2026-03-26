@@ -1,5 +1,5 @@
 {
-  "name": "@daveremy/tickler-mcp",
+  "name": "tickler-mcp",
   "version": "1.0.1",
   "description": "Persistent tickler/reminder MCP server for Claude Code and any MCP client",
   "type": "module",

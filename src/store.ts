@@ -3,9 +3,9 @@ import * as path from "path";
 import * as os from "os";
 import type { Tickler, TicklerStore } from "./types.js";
 
-// Storage path: TICKLER_STORAGE_PATH env var overrides the default
+// Storage path: TICKLER_PATH env var overrides the default
 export const STORAGE_PATH =
-  process.env.TICKLER_STORAGE_PATH ??
+  process.env.TICKLER_PATH ??
   path.join(os.homedir(), ".tickler", "ticklers.json");
 
 const LOCK_PATH = STORAGE_PATH + ".lock";
@@ -23,7 +23,11 @@ export function readStore(): TicklerStore {
     return { ticklers: [] };
   }
   const raw = fs.readFileSync(STORAGE_PATH, "utf-8");
-  return JSON.parse(raw) as TicklerStore;
+  try {
+    return JSON.parse(raw) as TicklerStore;
+  } catch {
+    throw new Error(`Tickler store is corrupted at ${STORAGE_PATH}. Fix the JSON or delete the file to start fresh.`);
+  }
 }
 
 // Atomic write: write to temp, then rename

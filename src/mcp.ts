@@ -183,6 +183,11 @@ server.tool(
       due.setTime(due.getTime() + ms);
       newDue = due.toISOString();
       tickler.due = newDue;
+      // Re-open a completed tickler if it's being snoozed
+      if (tickler.status === "done") {
+        tickler.status = "pending";
+        tickler.completedAt = null;
+      }
       writeStore(store);
     });
 
