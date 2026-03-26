@@ -1,0 +1,47 @@
+{
+  "name": "@daveremy/tickler-mcp",
+  "version": "1.0.0",
+  "description": "Persistent tickler/reminder MCP server for Claude Code and any MCP client",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "tickler",
+    "reminder",
+    "cli",
+    "agent",
+    "claude"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/daveremy/tickler-mcp.git"
+  },
+  "bin": {
+    "tickler": "./dist/cli.js",
+    "tickler-mcp": "./dist/mcp.js"
+  },
+  "files": [
+    "dist",
+    ".claude-plugin",
+    "skill"
+  ],
+  "scripts": {
+    "build": "tsc && chmod +x dist/cli.js dist/mcp.js",
+    "prepublishOnly": "npm run build",
+    "dev": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "commander": "^14.0.3",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  }
+}
