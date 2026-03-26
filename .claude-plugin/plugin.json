@@ -1,7 +1,7 @@
 {
   "name": "tickler-mcp",
   "description": "Persistent ticklers/reminders that survive agent session restarts",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
     "name": "daveremy"
   },
@@ -10,7 +10,7 @@
   "mcpServers": {
     "tickler-mcp": {
       "command": "npx",
-      "args": ["-y", "tickler-mcp"]
+      "args": ["-y", "-p", "tickler-mcp", "tickler-mcp"]
     }
   }
 }

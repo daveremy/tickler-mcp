@@ -1,3 +1,10 @@
+---
+name: tickler
+description: Create, check, and manage persistent ticklers (reminders that survive agent session restarts). Use when an agent needs to follow up on something later, or to check what reminders are due.
+argument-hint: "[check | list | create <title> | complete <id> | snooze <id> <duration>]"
+allowed-tools: mcp__tickler-mcp__tickler_create, mcp__tickler-mcp__tickler_check, mcp__tickler-mcp__tickler_list, mcp__tickler-mcp__tickler_complete, mcp__tickler-mcp__tickler_delete, mcp__tickler-mcp__tickler_snooze
+---
+
 # Tickler — Persistent Reminders
 
 Use this skill to create, check, and manage ticklers: reminders that persist across agent session restarts via a local JSON store.

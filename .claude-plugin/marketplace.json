@@ -1,0 +1,10 @@
+{
+  "name": "tickler-mcp-plugins",
+  "owner": { "name": "daveremy" },
+  "plugins": [{
+    "name": "tickler-mcp",
+    "source": { "source": "npm", "package": "tickler-mcp" },
+    "description": "Persistent ticklers/reminders that survive agent session restarts",
+    "version": "1.0.1"
+  }]
+}

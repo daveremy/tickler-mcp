@@ -6,8 +6,7 @@ import * as crypto from "crypto";
 import type { Tickler } from "./types.js";
 import { readStore, writeStore, withLock, formatTickler } from "./store.js";
 import { parseDuration } from "./duration.js";
-
-const VERSION = "1.0.0";
+import { VERSION } from "./version.js";
 
 const server = new McpServer({ name: "tickler-mcp", version: VERSION });
 

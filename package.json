@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "keywords": [
     "mcp",
@@ -21,18 +21,20 @@
     "url": "git+https://github.com/daveremy/tickler-mcp.git"
   },
   "bin": {
-    "tickler": "dist/cli.js",
-    "tickler-mcp": "dist/mcp.js"
+    "tickler": "./dist/cli.js",
+    "tickler-mcp": "./dist/mcp.js"
   },
   "files": [
-    "dist",
-    ".claude-plugin",
-    "skill"
+    "dist/",
+    ".claude-plugin/",
+    "skills/"
   ],
   "scripts": {
     "build": "tsc && chmod +x dist/cli.js dist/mcp.js",
-    "prepublishOnly": "npm run build",
-    "dev": "tsx src/cli.ts"
+    "prepack": "npm run build",
+    "dev": "tsx src/mcp.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "release": "./scripts/release.sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",

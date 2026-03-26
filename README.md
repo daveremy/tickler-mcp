@@ -4,77 +4,39 @@ Persistent ticklers/reminders for Claude Code agents and any MCP client. Tickler
 
 **The core problem it solves:** Claude agents run in sessions. When a session ends, in-memory state is gone. If an agent wants to follow up on something in 3 days, it has no place to put that intention. tickler-mcp is that place.
 
-## Install
+## Plugin Install (Claude Code)
 
-### As an MCP server (recommended)
-
-```bash
-# npx — no install required
-npx -y @daveremy/tickler-mcp
-
-# or install globally
-npm install -g @daveremy/tickler-mcp
-```
-
-### Claude Code plugin
+Two steps — add the marketplace, then install the plugin:
 
 ```bash
-claude plugin add @daveremy/tickler-mcp
+claude plugin marketplace add daveremy/tickler-mcp
+claude plugin install tickler-mcp@tickler-mcp-plugins --scope user
 ```
 
-Or add manually to `.mcp.json`:
+Start a new Claude Code session after installing. The 6 tickler MCP tools will be available, and the bundled `/tickler` skill will work automatically.
+
+## Manual Install
+
+Add to your `.mcp.json` (or `~/Library/Application Support/Claude/claude_desktop_config.json` for Claude Desktop):
 
 ```json
 {
   "mcpServers": {
     "tickler-mcp": {
       "command": "npx",
-      "args": ["-y", "@daveremy/tickler-mcp"]
+      "args": ["-y", "-p", "tickler-mcp", "tickler-mcp"]
     }
   }
 }
 ```
 
-### Claude Desktop
+Or install globally:
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "tickler-mcp": {
-      "command": "npx",
-      "args": ["-y", "@daveremy/tickler-mcp"]
-    }
-  }
-}
+```bash
+npm install -g tickler-mcp
 ```
 
-### Cursor
-
-Add to your MCP config under `mcpServers` — same format as Claude Desktop above.
-
-## Storage
-
-Default: `~/.tickler/ticklers.json`
-
-Override with an environment variable:
-
-```json
-{
-  "mcpServers": {
-    "tickler-mcp": {
-      "command": "npx",
-      "args": ["-y", "@daveremy/tickler-mcp"],
-      "env": {
-        "TICKLER_STORAGE_PATH": "/path/to/your/ticklers.json"
-      }
-    }
-  }
-}
-```
-
-## MCP Tools
+## Tools Reference
 
 | Tool | Description |
 |---|---|
@@ -111,6 +73,37 @@ tickler delete <id>
 # Snooze (duration string: 30m, 3h, 1d, 1w)
 tickler snooze <id> 3d
 tickler snooze <id> 4h
+```
+
+## Skills
+
+The plugin bundles a `/tickler` skill. After installing the plugin, use it directly:
+
+```
+/tickler check
+/tickler create "Follow up on invoice in 3 days"
+```
+
+The skill orchestrates tool calls and presents results conversationally.
+
+## Storage
+
+Default: `~/.tickler/ticklers.json`
+
+Override with an environment variable:
+
+```json
+{
+  "mcpServers": {
+    "tickler-mcp": {
+      "command": "npx",
+      "args": ["-y", "-p", "tickler-mcp", "tickler-mcp"],
+      "env": {
+        "TICKLER_PATH": "/path/to/your/ticklers.json"
+      }
+    }
+  }
+}
 ```
 
 ## Integration Patterns
@@ -164,6 +157,14 @@ node dist/cli.js list
 
 # Test MCP (stdio)
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | node dist/mcp.js
+```
+
+### Release
+
+```bash
+npm run release patch   # 0.1.0 -> 0.1.1
+npm run release minor   # 0.1.1 -> 0.2.0
+npm run release major   # 0.2.0 -> 1.0.0
 ```
 
 See `CLAUDE.md` for full dev guide.
