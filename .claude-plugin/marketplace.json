@@ -5,6 +5,6 @@
     "name": "tickler-mcp",
     "source": { "source": "npm", "package": "tickler-mcp" },
     "description": "Persistent ticklers/reminders that survive agent session restarts",
-    "version": "1.0.1"
+    "version": "0.2.0"
   }]
 }

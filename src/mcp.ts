@@ -4,7 +4,16 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import * as crypto from "crypto";
 import type { Tickler } from "./types.js";
-import { readStore, writeStore, withLock, formatTickler } from "./store.js";
+import {
+  createTickler,
+  listTicklers,
+  checkTicklers,
+  completeTickler,
+  deleteTickler,
+  snoozeTickler,
+  getTickler,
+  formatTickler,
+} from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
 
@@ -38,11 +47,7 @@ server.tool(
       completedAt: null,
     };
 
-    withLock(() => {
-      const store = readStore();
-      store.ticklers.push(tickler);
-      writeStore(store);
-    });
+    createTickler(tickler);
 
     return {
       content: [{
@@ -61,12 +66,7 @@ server.tool(
     tag: z.string().optional().describe("Filter by tag (exact match)"),
   },
   async ({ status, tag }) => {
-    const store = readStore();
-    let results = store.ticklers;
-
-    if (status) results = results.filter((t) => t.status === status);
-    if (tag) results = results.filter((t) => t.tags.includes(tag));
-    results = results.sort((a, b) => new Date(a.due).getTime() - new Date(b.due).getTime());
+    const results = listTicklers({ status, tag });
 
     if (results.length === 0) {
       return { content: [{ type: "text" as const, text: "No ticklers found." }] };
@@ -82,11 +82,7 @@ server.tool(
   "Return only past-due pending ticklers (due <= now). Designed for cron polling — call this at the start of each review session.",
   {},
   async () => {
-    const now = new Date();
-    const store = readStore();
-    const overdue = store.ticklers
-      .filter((t) => t.status === "pending" && new Date(t.due) <= now)
-      .sort((a, b) => new Date(a.due).getTime() - new Date(b.due).getTime());
+    const overdue = checkTicklers();
 
     if (overdue.length === 0) {
       return { content: [{ type: "text" as const, text: "No past-due ticklers." }] };
@@ -104,24 +100,12 @@ server.tool(
     id: z.string().describe("ID of the tickler to mark complete"),
   },
   async ({ id }) => {
-    let found = false;
-    let ticklerTitle = "";
-
-    withLock(() => {
-      const store = readStore();
-      const tickler = store.ticklers.find((t) => t.id === id);
-      if (!tickler) return;
-      found = true;
-      ticklerTitle = tickler.title;
-      tickler.status = "done";
-      tickler.completedAt = new Date().toISOString();
-      writeStore(store);
-    });
-
-    if (!found) {
+    const tickler = getTickler(id);
+    if (!tickler) {
       return { content: [{ type: "text" as const, text: `Error: No tickler found with ID "${id}"` }], isError: true };
     }
-    return { content: [{ type: "text" as const, text: `Marked complete: "${ticklerTitle}" (${id})` }] };
+    completeTickler(id);
+    return { content: [{ type: "text" as const, text: `Marked complete: "${tickler.title}" (${id})` }] };
   },
 );
 
@@ -132,23 +116,12 @@ server.tool(
     id: z.string().describe("ID of the tickler to delete"),
   },
   async ({ id }) => {
-    let found = false;
-    let ticklerTitle = "";
-
-    withLock(() => {
-      const store = readStore();
-      const idx = store.ticklers.findIndex((t) => t.id === id);
-      if (idx === -1) return;
-      found = true;
-      ticklerTitle = store.ticklers[idx].title;
-      store.ticklers.splice(idx, 1);
-      writeStore(store);
-    });
-
-    if (!found) {
+    const tickler = getTickler(id);
+    if (!tickler) {
       return { content: [{ type: "text" as const, text: `Error: No tickler found with ID "${id}"` }], isError: true };
     }
-    return { content: [{ type: "text" as const, text: `Deleted: "${ticklerTitle}" (${id})` }] };
+    deleteTickler(id);
+    return { content: [{ type: "text" as const, text: `Deleted: "${tickler.title}" (${id})` }] };
   },
 );
 
@@ -168,32 +141,17 @@ server.tool(
       };
     }
 
-    let found = false;
-    let newDue = "";
-    let ticklerTitle = "";
-
-    withLock(() => {
-      const store = readStore();
-      const tickler = store.ticklers.find((t) => t.id === id);
-      if (!tickler) return;
-      found = true;
-      ticklerTitle = tickler.title;
-      const due = new Date(tickler.due);
-      due.setTime(due.getTime() + ms);
-      newDue = due.toISOString();
-      tickler.due = newDue;
-      // Re-open a completed tickler if it's being snoozed
-      if (tickler.status === "done") {
-        tickler.status = "pending";
-        tickler.completedAt = null;
-      }
-      writeStore(store);
-    });
-
-    if (!found) {
+    const tickler = getTickler(id);
+    if (!tickler) {
       return { content: [{ type: "text" as const, text: `Error: No tickler found with ID "${id}"` }], isError: true };
     }
-    return { content: [{ type: "text" as const, text: `Snoozed "${ticklerTitle}" by ${duration} — new due: ${newDue}` }] };
+
+    const due = new Date(tickler.due);
+    due.setTime(due.getTime() + ms);
+    const newDue = due.toISOString();
+    snoozeTickler(id, newDue);
+
+    return { content: [{ type: "text" as const, text: `Snoozed "${tickler.title}" by ${duration} — new due: ${newDue}` }] };
   },
 );
 

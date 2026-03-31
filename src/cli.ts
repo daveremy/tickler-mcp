@@ -2,7 +2,17 @@
 import { Command } from "commander";
 import * as crypto from "crypto";
 import type { Tickler } from "./types.js";
-import { readStore, writeStore, withLock, formatTickler, STORAGE_PATH } from "./store.js";
+import {
+  createTickler,
+  listTicklers,
+  checkTicklers,
+  completeTickler,
+  deleteTickler,
+  snoozeTickler,
+  getTickler,
+  formatTickler,
+  getDbPath,
+} from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
 
@@ -17,11 +27,7 @@ program
   .command("check")
   .description("Show past-due pending ticklers (exit 1 if any are due, 0 if none)")
   .action(() => {
-    const now = new Date();
-    const store = readStore();
-    const overdue = store.ticklers
-      .filter((t) => t.status === "pending" && new Date(t.due) <= now)
-      .sort((a, b) => new Date(a.due).getTime() - new Date(b.due).getTime());
+    const overdue = checkTicklers();
 
     if (overdue.length === 0) {
       console.log("No past-due ticklers.");
@@ -38,20 +44,13 @@ program
   .option("--status <status>", "Filter: pending or done")
   .option("--tag <tag>", "Filter by tag")
   .action((opts: { status?: string; tag?: string }) => {
-    const store = readStore();
-    let results = store.ticklers;
+    if (opts.status && opts.status !== "pending" && opts.status !== "done") {
+      console.error('Error: --status must be "pending" or "done"');
+      process.exit(1);
+    }
 
-    if (opts.status) {
-      if (opts.status !== "pending" && opts.status !== "done") {
-        console.error('Error: --status must be "pending" or "done"');
-        process.exit(1);
-      }
-      results = results.filter((t) => t.status === opts.status);
-    }
-    if (opts.tag) {
-      results = results.filter((t) => t.tags.includes(opts.tag!));
-    }
-    results = results.sort((a, b) => new Date(a.due).getTime() - new Date(b.due).getTime());
+    const status = opts.status as "pending" | "done" | undefined;
+    const results = listTicklers({ status, tag: opts.tag });
 
     if (results.length === 0) {
       console.log("No ticklers found.");
@@ -75,7 +74,10 @@ program
       process.exit(1);
     }
 
-    const tags = opts.tags ? opts.tags.split(",").map((t) => t.trim()) : [];
+    const tags = opts.tags
+      ? opts.tags.split(",").map((t) => t.trim()).filter((t) => t.length > 0)
+      : [];
+
     const tickler: Tickler = {
       id: crypto.randomUUID(),
       title,
@@ -88,66 +90,39 @@ program
       completedAt: null,
     };
 
-    withLock(() => {
-      const store = readStore();
-      store.ticklers.push(tickler);
-      writeStore(store);
-    });
+    createTickler(tickler);
 
     console.log(`Created: ${tickler.id}`);
     console.log(`Title:   ${tickler.title}`);
     console.log(`Due:     ${tickler.due}`);
     if (tags.length > 0) console.log(`Tags:    ${tags.join(", ")}`);
-    console.log(`Store:   ${STORAGE_PATH}`);
+    console.log(`Store:   ${getDbPath()}`);
   });
 
 program
   .command("complete <id>")
   .description("Mark a tickler as done (keeps history)")
   .action((id: string) => {
-    let found = false;
-    let ticklerTitle = "";
-
-    withLock(() => {
-      const store = readStore();
-      const tickler = store.ticklers.find((t) => t.id === id);
-      if (!tickler) return;
-      found = true;
-      ticklerTitle = tickler.title;
-      tickler.status = "done";
-      tickler.completedAt = new Date().toISOString();
-      writeStore(store);
-    });
-
-    if (!found) {
+    const tickler = getTickler(id);
+    if (!tickler) {
       console.error(`Error: No tickler found with ID "${id}"`);
       process.exit(1);
     }
-    console.log(`Marked complete: "${ticklerTitle}" (${id})`);
+    completeTickler(id);
+    console.log(`Marked complete: "${tickler.title}" (${id})`);
   });
 
 program
   .command("delete <id>")
   .description("Permanently delete a tickler (use complete to keep history)")
   .action((id: string) => {
-    let found = false;
-    let ticklerTitle = "";
-
-    withLock(() => {
-      const store = readStore();
-      const idx = store.ticklers.findIndex((t) => t.id === id);
-      if (idx === -1) return;
-      found = true;
-      ticklerTitle = store.ticklers[idx].title;
-      store.ticklers.splice(idx, 1);
-      writeStore(store);
-    });
-
-    if (!found) {
+    const tickler = getTickler(id);
+    if (!tickler) {
       console.error(`Error: No tickler found with ID "${id}"`);
       process.exit(1);
     }
-    console.log(`Deleted: "${ticklerTitle}" (${id})`);
+    deleteTickler(id);
+    console.log(`Deleted: "${tickler.title}" (${id})`);
   });
 
 program
@@ -160,33 +135,18 @@ program
       process.exit(1);
     }
 
-    let found = false;
-    let newDue = "";
-    let ticklerTitle = "";
-
-    withLock(() => {
-      const store = readStore();
-      const tickler = store.ticklers.find((t) => t.id === id);
-      if (!tickler) return;
-      found = true;
-      ticklerTitle = tickler.title;
-      const due = new Date(tickler.due);
-      due.setTime(due.getTime() + ms);
-      newDue = due.toISOString();
-      tickler.due = newDue;
-      // Re-open a completed tickler if it's being snoozed
-      if (tickler.status === "done") {
-        tickler.status = "pending";
-        tickler.completedAt = null;
-      }
-      writeStore(store);
-    });
-
-    if (!found) {
+    const tickler = getTickler(id);
+    if (!tickler) {
       console.error(`Error: No tickler found with ID "${id}"`);
       process.exit(1);
     }
-    console.log(`Snoozed "${ticklerTitle}" by ${duration} — new due: ${newDue}`);
+
+    const due = new Date(tickler.due);
+    due.setTime(due.getTime() + ms);
+    const newDue = due.toISOString();
+    snoozeTickler(id, newDue);
+
+    console.log(`Snoozed "${tickler.title}" by ${duration} — new due: ${newDue}`);
   });
 
 program.parse();
