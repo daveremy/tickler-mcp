@@ -1,6 +1,6 @@
 {
   "name": "tickler-mcp",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "Persistent tickler/reminder MCP server for Claude Code and any MCP client",
   "type": "module",
   "license": "MIT",
@@ -38,10 +38,12 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "better-sqlite3": "^12.8.0",
     "commander": "^14.0.3",
     "zod": "^3.25.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "tsx": "^4.21.0",
     "typescript": "^5.7.0"
