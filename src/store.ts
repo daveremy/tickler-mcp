@@ -4,32 +4,26 @@ import * as path from "path";
 import * as os from "os";
 import type { Tickler } from "./types.js";
 
-// DB path: TICKLER_DB_PATH env var overrides the default.
-// Resolved lazily at first use so tests can set the env var before importing.
-function resolveDbPath(): string {
+// Resolved lazily at each call so tests can set TICKLER_DB_PATH before importing.
+export function getDbPath(): string {
   return (
     process.env.TICKLER_DB_PATH ??
     path.join(os.homedir(), "obsidian", "data", "ticklers.db")
   );
 }
 
-function resolveLegacyJsonPath(): string {
+function getLegacyJsonPath(): string {
   return (
     process.env.TICKLER_PATH ??
     path.join(os.homedir(), ".tickler", "ticklers.json")
   );
 }
 
-// Exported for display (e.g., CLI "Store: ..." message). Resolves lazily.
-export function getDbPath(): string {
-  return resolveDbPath();
-}
-
 let _db: Database.Database | undefined;
 let _dbPath: string | undefined;
 
 function getDb(): Database.Database {
-  const dbPath = resolveDbPath();
+  const dbPath = getDbPath();
 
   // Re-initialize if env var changed (e.g., between test files)
   if (_db && _dbPath === dbPath) return _db;
@@ -47,7 +41,7 @@ function getDb(): Database.Database {
 
   _db = openDb(dbPath);
   _dbPath = dbPath;
-  runMigration(_db, resolveLegacyJsonPath());
+  runMigration(_db, getLegacyJsonPath());
 
   return _db;
 }
