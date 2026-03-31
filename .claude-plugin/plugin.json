@@ -1,7 +1,7 @@
 {
   "name": "tickler-mcp",
   "description": "Persistent ticklers/reminders that survive agent session restarts",
-  "version": "0.2.0",
+  "version": "1.1.0",
   "author": {
     "name": "daveremy"
   },
