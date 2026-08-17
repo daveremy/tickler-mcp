@@ -477,27 +477,78 @@ describe("store: due normalization (issue #3)", () => {
       rmDb(dbPath);
     });
 
+    test("a backfill blocked by another writer fails safe instead of throwing", () => {
+      // The backfill's contract is that it never throws: it runs inside openDb,
+      // so an exception here makes the store unopenable for that process. With
+      // 16 MCP processes sharing the file, losing the write lock is routine, not
+      // exotic. Exercises the real function rather than a copy of its SQL.
+      const dbPath = tmpDbPath("backfill-busy");
+      const owner = rawDb(dbPath);
+
+      const legacy = inOffset(new Date(Date.now() + 86400_000), -7);
+      owner.prepare(
+        "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+      ).run("contended", "contended", legacy, new Date().toISOString());
+
+      // A second connection, as a second process would be.
+      const other = new Database(dbPath);
+      other.pragma("busy_timeout = 50"); // fail fast instead of the 5s default
+
+      owner.exec("BEGIN IMMEDIATE"); // hold the write lock
+      try {
+        // Readers are not blocked, so the probe still finds work to do — the
+        // function reaches the transaction and cannot acquire the lock.
+        assert.equal(
+          normalizeStoredDueDates(other),
+          0,
+          "must report no work done rather than throwing"
+        );
+      } finally {
+        owner.exec("ROLLBACK");
+      }
+
+      // Left untouched, so the next open retries it — self-healing, not skipped.
+      const after = (
+        owner.prepare("SELECT due FROM ticklers WHERE id = 'contended'").get() as { due: string }
+      ).due;
+      assert.equal(after, legacy, "the row must survive for a later attempt");
+
+      // And a later attempt, uncontended, does repair it.
+      assert.equal(normalizeStoredDueDates(other), 1);
+
+      other.close();
+      owner.close();
+      rmDb(dbPath);
+    });
+
     test("does not clobber a due that changed after the row was read", () => {
-      // The backfill reads candidates, then writes. Another process can snooze a
-      // tickler in between. If the UPDATE did not guard on the old value it
-      // would overwrite that snooze with a value derived from a stale read —
-      // resurrecting a fire-early tickler, the bug this file exists to prevent.
+      // A concurrent snoozeTickler landing between the backfill's read and its
+      // write must not be overwritten by a stale-read value — that would push
+      // the tickler back to its old due date and fire it early, the exact bug
+      // this file exists to prevent.
+      //
+      // The interleaving cannot be staged directly: normalizeStoredDueDates is
+      // synchronous and now holds the write lock across read and write, so there
+      // is no seam to inject a concurrent writer into. Instead this pins the
+      // second of the two guards — the `AND due = @old` predicate — by driving
+      // the real function against a row whose stored value no longer matches
+      // what a stale reader would have seen.
       const dbPath = tmpDbPath("backfill-race");
       const db = rawDb(dbPath);
 
       const legacy = inOffset(new Date(Date.now() + 86400_000), -7);
+      const snoozedTo = new Date(Date.now() + 9 * 86400_000).toISOString();
+
       db.prepare(
         "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
       ).run("raced", "raced", legacy, new Date().toISOString());
 
-      // Simulate the concurrent write landing between read and write.
-      const snoozedTo = new Date(Date.now() + 9 * 86400_000).toISOString();
-      const update = db.prepare("UPDATE ticklers SET due = @due WHERE id = @id AND due = @old");
+      // The concurrent snooze wins the race and writes a canonical value.
       db.prepare("UPDATE ticklers SET due = ? WHERE id = 'raced'").run(snoozedTo);
 
-      // A stale-read write must not land.
-      const result = update.run({ id: "raced", due: "1999-01-01T00:00:00.000Z", old: legacy });
-      assert.equal(result.changes, 0, "guarded update must not match a row that moved on");
+      // The row is now canonical, so the backfill must find nothing to do and
+      // must leave the snooze alone.
+      assert.equal(normalizeStoredDueDates(db), 0, "canonical row is not a candidate");
 
       const due = (db.prepare("SELECT due FROM ticklers WHERE id = 'raced'").get() as { due: string }).due;
       assert.equal(due, snoozedTo, "the concurrent snooze must survive");
