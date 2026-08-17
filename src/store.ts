@@ -19,6 +19,68 @@ function getLegacyJsonPath(): string {
   );
 }
 
+/** `YYYY-MM-DD` with no time part. Tested before `Date.parse` — see `normalizeDue`. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Canonicalize a due timestamp to UTC-Z (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+ *
+ * Every write path funnels through here so the `due` TEXT column ever holds only
+ * one spelling of an instant. `checkTicklers` compares `due` against
+ * `new Date().toISOString()` using SQLite's lexicographic `<=`, which is a valid
+ * instant comparison only when both sides share a frame of reference. Storing
+ * input verbatim let a `-07:00` timestamp sort as though it were UTC, firing
+ * reminders up to a full offset early — always early, never late, which is why
+ * it read as working software for so long (issue #3).
+ *
+ * How each input shape is read — all three are deliberate choices, made here at
+ * the write boundary while the author's intent is still available:
+ *
+ * - **Explicit offset or `Z`** (`2026-08-17T09:00:00-07:00`) — the instant it denotes.
+ * - **Naive** (`2026-08-17T09:00:00`, no offset) — the author's *local* time.
+ *   This is what `new Date()` already does, and it is the right reading: someone
+ *   writing "09:00" means 09:00 where they are.
+ * - **Date-only** (`2026-08-17`) — *local* midnight. ECMA-262 parses date-only
+ *   forms as UTC midnight, which would contradict the naive rule above and, west
+ *   of Greenwich, fire the reminder the previous evening. The CLI's `--due` help
+ *   advertises `YYYY-MM-DD`, so this shape is not hypothetical.
+ *
+ * @throws {RangeError} when `due` cannot be parsed. Failing loudly at write time
+ * beats storing a string that mis-sorts silently forever.
+ */
+export function normalizeDue(due: string): string {
+  if (typeof due !== "string") {
+    throw new RangeError(
+      `Invalid due date ${JSON.stringify(due)} — expected an ISO 8601 string.`
+    );
+  }
+
+  const raw = due.trim();
+
+  if (DATE_ONLY.test(raw)) {
+    const [year, month, day] = raw.split("-").map(Number);
+    const localMidnight = new Date(year, month - 1, day);
+    // `new Date(2026, 1, 30)` rolls over to March 2 rather than throwing, so an
+    // impossible calendar date has to be rejected by reading the parts back.
+    if (
+      localMidnight.getFullYear() !== year ||
+      localMidnight.getMonth() !== month - 1 ||
+      localMidnight.getDate() !== day
+    ) {
+      throw new RangeError(`Invalid due date "${due}" — no such calendar date.`);
+    }
+    return localMidnight.toISOString();
+  }
+
+  const ms = Date.parse(raw);
+  if (Number.isNaN(ms)) {
+    throw new RangeError(
+      `Invalid due date "${due}". Use ISO 8601, e.g. 2026-04-01T09:00:00-07:00.`
+    );
+  }
+  return new Date(ms).toISOString();
+}
+
 let _db: Database.Database | undefined;
 let _dbPath: string | undefined;
 
@@ -65,7 +127,62 @@ function openDb(dbPath: string): Database.Database {
     )
   `);
 
+  normalizeStoredDueDates(db);
+
   return db;
+}
+
+/**
+ * Canonical UTC-Z shape, exactly as `toISOString()` emits it. GLOB rather than
+ * LIKE because GLOB is case-sensitive and can assert digits — LIKE would treat a
+ * trailing lowercase `z` as already-canonical and skip a row that needs fixing.
+ */
+const CANONICAL_DUE_GLOB =
+  "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z";
+
+/**
+ * Rewrite any `due` still stored in a pre-normalization format (issue #3).
+ * Returns the number of rows changed. Exported for testing.
+ *
+ * Runs on every DB open rather than behind a `user_version` gate. Up to 16 MCP
+ * processes share this file, and during a rollout an older binary can write a
+ * legacy row *after* a one-time migration has already fired — a version gate
+ * would never look again, while this check is self-healing. It stays cheap: the
+ * GLOB prefilter matches every healthy row, so the normal case is one scan of a
+ * small table that writes nothing.
+ *
+ * Never throws. A single malformed row must not make the store unopenable for
+ * every process on the box; unparseable rows are logged and left untouched.
+ */
+export function normalizeStoredDueDates(db: Database.Database): number {
+  const candidates = db
+    .prepare(`SELECT id, due FROM ticklers WHERE due NOT GLOB '${CANONICAL_DUE_GLOB}'`)
+    .all() as { id: string; due: string }[];
+
+  if (candidates.length === 0) return 0;
+
+  const update = db.prepare("UPDATE ticklers SET due = @due WHERE id = @id");
+  let changed = 0;
+
+  db.transaction(() => {
+    for (const row of candidates) {
+      let normalized: string;
+      try {
+        normalized = normalizeDue(row.due);
+      } catch {
+        console.error(
+          `tickler-mcp: tickler ${row.id} has an unparseable due "${row.due}" — left as-is.`
+        );
+        continue;
+      }
+      if (normalized !== row.due) {
+        update.run({ id: row.id, due: normalized });
+        changed++;
+      }
+    }
+  })();
+
+  return changed;
 }
 
 /**
@@ -105,13 +222,30 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
     VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until)
   `);
 
+  let skipped = 0;
+
   const migrate = db.transaction((rows: Tickler[]) => {
     for (const t of rows) {
+      // An unparseable due in legacy JSON must not abort the whole import — but
+      // it must not be swallowed either. Skip the row, count it, and let the
+      // caller decline the rename so the source file stays recoverable.
+      let due: string;
+      try {
+        due = normalizeDue(t.due);
+      } catch (err) {
+        if (!(err instanceof RangeError)) throw err;
+        skipped++;
+        console.error(
+          `tickler-mcp: skipping tickler ${t.id ?? "(no id)"} from ${jsonPath} — ${err.message}`
+        );
+        continue;
+      }
+
       insert.run({
         id: t.id,
         title: t.title,
         body: t.body ?? null,
-        due: t.due,
+        due,
         creator: t.creator ?? null,
         tags: JSON.stringify(Array.isArray(t.tags) ? t.tags : []),
         status: t.status ?? "pending",
@@ -123,6 +257,18 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
   });
 
   migrate(ticklers);
+
+  // A skipped row means the JSON holds data the DB does not. Renaming it here
+  // would destroy the only copy. Bail out before the count check below — that
+  // check counts every row in the table rather than the ones just imported, so
+  // on a non-empty DB it would happily wave a lossy migration through.
+  if (skipped > 0) {
+    console.error(
+      `tickler-mcp: ${skipped} tickler(s) in ${jsonPath} had an unparseable due date and were ` +
+        `not imported. Leaving the file in place for manual recovery — it will NOT be renamed.`
+    );
+    return;
+  }
 
   // Verify all rows made it in before renaming
   const dbCount = (
@@ -161,7 +307,7 @@ export function createTickler(tickler: Tickler): void {
     id: tickler.id,
     title: tickler.title,
     body: tickler.body ?? null,
-    due: tickler.due,
+    due: normalizeDue(tickler.due),
     creator: tickler.creator ?? null,
     tags: JSON.stringify(tickler.tags ?? []),
     status: tickler.status,
@@ -224,10 +370,14 @@ export function deleteTickler(id: string): boolean {
 
 export function snoozeTickler(id: string, newDue: string): boolean {
   const db = getDb();
+  // Normalize here too, not just in createTickler: a snooze writes `due` exactly
+  // as a create does, and fixing only create leaves the same bug reachable by a
+  // different door while looking identical from the outside.
+  const due = normalizeDue(newDue);
   // Re-open a completed tickler if it is being snoozed
   const result = db.prepare(
     "UPDATE ticklers SET due = @due, status = 'pending', completed_at = NULL WHERE id = @id"
-  ).run({ id, due: newDue });
+  ).run({ id, due });
   return result.changes > 0;
 }
 

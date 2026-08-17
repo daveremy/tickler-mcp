@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import * as crypto from "crypto";
+import Database from "better-sqlite3";
 
 // Each test suite gets its own DB file via env var
 const TEST_DB = path.join(os.tmpdir(), `tickler-test-${crypto.randomUUID()}.db`);
@@ -19,6 +20,8 @@ import {
   snoozeTickler,
   getTickler,
   runMigration,
+  normalizeDue,
+  normalizeStoredDueDates,
 } from "../src/store.js";
 import type { Tickler } from "../src/types.js";
 
@@ -264,6 +267,271 @@ describe("store: JSON migration", () => {
     // Clean up
     fs.unlinkSync(corruptedJson);
     try { fs.unlinkSync(migrationDb); } catch { /* ignore */ }
+  });
+});
+
+/**
+ * Issue #3 — `due` was stored exactly as supplied while `checkTicklers` compares
+ * it lexicographically against a UTC-Z `now`, so any offset or naive timestamp
+ * fired up to a full offset early.
+ *
+ * Every assertion below is timezone-independent on purpose. Under `TZ=UTC` a
+ * naive-vs-UTC-Z comparison is identical on both sides, so a test written around
+ * a hardcoded `-07:00` fixture would pass without proving anything. Expected
+ * values are therefore *constructed* — from local-time constructors, or by
+ * rendering a known instant into a fixed offset frame — never hardcoded.
+ */
+const CANONICAL_UTC_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+const pad = (n: number) => String(n).padStart(2, "0");
+
+/** Render `instant` as a wall-clock string carrying an explicit `±HH:00` offset. */
+function inOffset(instant: Date, offsetHours: number): string {
+  const shifted = new Date(instant.getTime() + offsetHours * 3600_000);
+  const sign = offsetHours < 0 ? "-" : "+";
+  return (
+    `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}` +
+    `T${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())}` +
+    `${sign}${pad(Math.abs(offsetHours))}:00`
+  );
+}
+
+/** Render `d` as a naive local timestamp — no offset, no `Z`. */
+function naiveLocal(d: Date): string {
+  return (
+    `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+    `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+  );
+}
+
+/** A raw handle with the ticklers schema, bypassing `openDb`'s backfill. */
+function rawDb(dbPath: string): Database.Database {
+  const db = new Database(dbPath);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS ticklers (
+      id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, due TEXT NOT NULL,
+      creator TEXT, tags TEXT, status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL, completed_at TEXT, snoozed_until TEXT
+    )
+  `);
+  return db;
+}
+
+function tmpDbPath(label: string): string {
+  return path.join(os.tmpdir(), `tickler-${label}-${crypto.randomUUID()}.db`);
+}
+
+function rmDb(dbPath: string): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+  }
+}
+
+describe("store: due normalization (issue #3)", () => {
+  test("REGRESSION: a tickler due 2h out with a -07:00 offset does not fire", () => {
+    const twoHoursOut = new Date(Date.now() + 2 * 3600_000);
+    const due = inOffset(twoHoursOut, -7);
+
+    // Guard against a vacuous pass: this input is only a meaningful regression
+    // test if the shipped string comparison would actually have fired it. If
+    // this assertion ever fails the test below proves nothing, so it must fail
+    // loudly rather than quietly go green.
+    assert.ok(
+      due < new Date().toISOString(),
+      `test input is not exercising the bug: "${due}" does not sort before now`
+    );
+
+    const t = makeTickler({ title: "regression-offset-future", due });
+    createTickler(t);
+
+    const fired = checkTicklers();
+    assert.ok(
+      !fired.some((x) => x.id === t.id),
+      "a tickler 2h in the future must not be returned by checkTicklers()"
+    );
+  });
+
+  test("naive, offset and UTC-Z spellings of one instant round-trip identically", () => {
+    const instant = new Date(Date.now() + 5 * 3600_000);
+    instant.setMilliseconds(0); // naive/offset forms carry no milliseconds
+
+    const spellings = {
+      utcZ: instant.toISOString(),
+      offsetMinus7: inOffset(instant, -7),
+      offsetPlus5: inOffset(instant, 5),
+      naive: naiveLocal(instant),
+    };
+
+    const stored = Object.entries(spellings).map(([label, due]) => {
+      const t = makeTickler({ title: `roundtrip-${label}`, due });
+      createTickler(t);
+      return [label, getTickler(t.id)!.due] as const;
+    });
+
+    for (const [label, value] of stored) {
+      assert.equal(value, instant.toISOString(), `${label} should store the same instant`);
+    }
+  });
+
+  test("createTickler stores canonical UTC-Z", () => {
+    const t = makeTickler({ title: "canonical-create", due: inOffset(new Date(), -7) });
+    createTickler(t);
+    assert.match(getTickler(t.id)!.due, CANONICAL_UTC_Z);
+  });
+
+  test("snoozeTickler normalizes its own write path", () => {
+    const t = makeTickler({ title: "canonical-snooze" });
+    createTickler(t);
+
+    const target = new Date(Date.now() + 3 * 86400_000);
+    target.setMilliseconds(0);
+    snoozeTickler(t.id, inOffset(target, -7));
+
+    const found = getTickler(t.id)!;
+    assert.match(found.due, CANONICAL_UTC_Z);
+    assert.equal(found.due, target.toISOString());
+  });
+
+  test("the JSON import path normalizes on insert", () => {
+    // Uses a raw handle rather than a DB path: `openDb` runs the backfill, which
+    // would normalize these rows even if the insert path did not, hiding the
+    // very thing this test exists to prove.
+    const dbPath = tmpDbPath("import-normalize");
+    const jsonPath = path.join(os.tmpdir(), `ticklers-import-${crypto.randomUUID()}.json`);
+
+    const instant = new Date(Date.now() + 86400_000);
+    instant.setMilliseconds(0);
+    const legacy = makeTickler({ title: "import-offset", due: inOffset(instant, -7) });
+    fs.writeFileSync(jsonPath, JSON.stringify({ ticklers: [legacy] }));
+
+    const db = rawDb(dbPath);
+    runMigration(db, jsonPath);
+
+    const row = db.prepare("SELECT due FROM ticklers WHERE id = ?").get(legacy.id) as { due: string };
+    assert.equal(row.due, instant.toISOString(), "import must store UTC-Z, not the raw offset string");
+    db.close();
+
+    rmDb(dbPath);
+    try { fs.unlinkSync(jsonPath + ".migrated"); } catch { /* ignore */ }
+  });
+
+  test("createTickler throws on an unparseable due", () => {
+    const t = makeTickler({ title: "bad-create", due: "not-a-date" });
+    assert.throws(() => createTickler(t), RangeError);
+    assert.equal(getTickler(t.id), undefined, "nothing should have been stored");
+  });
+
+  test("snoozeTickler throws on an unparseable due", () => {
+    const t = makeTickler({ title: "bad-snooze" });
+    createTickler(t);
+    const before = getTickler(t.id)!.due;
+
+    assert.throws(() => snoozeTickler(t.id, "tomorrow-ish"), RangeError);
+    assert.equal(getTickler(t.id)!.due, before, "due should be untouched after a rejected snooze");
+  });
+
+  test("normalizeDue rejects an impossible calendar date", () => {
+    // `new Date(2026, 1, 30)` silently rolls over to March 2 instead of throwing.
+    assert.throws(() => normalizeDue("2026-02-30"), RangeError);
+  });
+
+  test("naive input is read as local time, not UTC", () => {
+    const naive = "2026-08-17T09:00:00";
+    const expected = new Date(2026, 7, 17, 9, 0, 0).toISOString();
+    assert.equal(normalizeDue(naive), expected);
+  });
+
+  test("date-only input is read as local midnight", () => {
+    // ECMA-262 parses a bare date as UTC midnight; west of Greenwich that would
+    // fire the reminder the previous evening.
+    assert.equal(normalizeDue("2026-08-17"), new Date(2026, 7, 17).toISOString());
+  });
+
+  describe("backfill of rows stored in a legacy format", () => {
+    test("normalizeStoredDueDates rewrites legacy rows and leaves canonical ones alone", () => {
+      const dbPath = tmpDbPath("backfill-unit");
+      const db = rawDb(dbPath);
+
+      const instant = new Date(Date.now() + 86400_000);
+      instant.setMilliseconds(0);
+      const canonical = new Date(Date.now() + 2 * 86400_000).toISOString();
+
+      const insert = db.prepare(
+        "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+      );
+      insert.run("legacy-offset", "legacy-offset", inOffset(instant, -7), canonical);
+      insert.run("legacy-naive", "legacy-naive", naiveLocal(instant), canonical);
+      insert.run("already-canonical", "already-canonical", canonical, canonical);
+      insert.run("unparseable", "unparseable", "definitely not a date", canonical);
+
+      const changed = normalizeStoredDueDates(db);
+      assert.equal(changed, 2, "only the two legacy rows should have been rewritten");
+
+      const due = (id: string) =>
+        (db.prepare("SELECT due FROM ticklers WHERE id = ?").get(id) as { due: string }).due;
+
+      assert.equal(due("legacy-offset"), instant.toISOString());
+      assert.equal(due("legacy-naive"), instant.toISOString());
+      assert.equal(due("already-canonical"), canonical);
+      assert.equal(due("unparseable"), "definitely not a date", "unparseable rows are left, not dropped");
+
+      // Idempotent: a second pass must be a no-op.
+      assert.equal(normalizeStoredDueDates(db), 0);
+
+      db.close();
+      rmDb(dbPath);
+    });
+
+    test("runs automatically when the store opens a DB holding legacy rows", () => {
+      const dbPath = tmpDbPath("backfill-integration");
+      const instant = new Date(Date.now() + 2 * 3600_000);
+      instant.setMilliseconds(0);
+
+      const seed = rawDb(dbPath);
+      seed.prepare(
+        "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+      ).run("legacy-on-open", "legacy-on-open", inOffset(instant, -7), new Date().toISOString());
+      seed.close();
+
+      const previous = process.env.TICKLER_DB_PATH;
+      process.env.TICKLER_DB_PATH = dbPath; // path change forces getDb() to re-open
+      try {
+        const found = getTickler("legacy-on-open");
+        assert.ok(found, "seeded row should be readable");
+        assert.equal(found.due, instant.toISOString(), "opening the store should have normalized it");
+        assert.ok(
+          !checkTicklers().some((t) => t.id === "legacy-on-open"),
+          "and it should no longer fire early"
+        );
+      } finally {
+        process.env.TICKLER_DB_PATH = previous;
+        getTickler("restore-connection"); // re-point the cached handle at TEST_DB
+      }
+
+      rmDb(dbPath);
+    });
+  });
+
+  test("import with an unparseable due keeps the source JSON for recovery", () => {
+    const dbPath = tmpDbPath("import-bad");
+    const jsonPath = path.join(os.tmpdir(), `ticklers-bad-${crypto.randomUUID()}.json`);
+
+    const good = makeTickler({ title: "import-good" });
+    const bad = makeTickler({ title: "import-bad", due: "whenever" });
+    fs.writeFileSync(jsonPath, JSON.stringify({ ticklers: [good, bad] }));
+
+    runMigration(dbPath, jsonPath);
+
+    const db = new Database(dbPath);
+    const row = db.prepare("SELECT due FROM ticklers WHERE id = ?").get(bad.id);
+    assert.equal(row, undefined, "the unparseable row must not be stored");
+    db.close();
+
+    assert.ok(fs.existsSync(jsonPath), "source JSON must be left in place for manual recovery");
+    assert.ok(!fs.existsSync(jsonPath + ".migrated"), "and must NOT be renamed");
+
+    fs.unlinkSync(jsonPath);
+    rmDb(dbPath);
   });
 });
 

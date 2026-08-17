@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Ticklers fired up to a full UTC offset early** ([#3](https://github.com/daveremy/tickler-mcp/issues/3)).
+  `due` was stored exactly as supplied in a TEXT column, while `checkTicklers` compares it
+  lexicographically against a UTC-Z `now`. A `due` carrying a numeric offset (or none at all) was
+  therefore compared across two different frames of reference — in MST, a reminder set for 09:00
+  local fired at 02:00. The error was always in the fire-early direction, which is why it read as
+  working software.
+
+### Added
+- `normalizeDue()` — canonicalizes `due` to UTC-Z at every write path (`createTickler`,
+  `snoozeTickler`, and the legacy JSON import), so lexicographic comparison is correct by
+  construction. An unparseable `due` now throws a `RangeError` at write time instead of being
+  stored as a string that mis-sorts silently forever.
+- `normalizeStoredDueDates()` — rewrites rows already stored in a legacy format when the DB is
+  opened. Idempotent and self-healing.
+
+### Changed
+- A `due` with no offset (`2026-04-01T09:00:00`) is documented as, and read as, **local** time.
+- A bare date (`2026-04-01`) is now read as **local** midnight rather than UTC midnight. ECMA-262
+  parses date-only forms as UTC, which contradicted the rule above and, west of Greenwich, fired
+  the reminder the previous evening.
+- The legacy JSON import no longer renames the source file to `.migrated` when any row was skipped,
+  so the only copy of unimported data is preserved for manual recovery.
+
 ## [0.2.0] - 2026-03-30
 
 ### Changed
