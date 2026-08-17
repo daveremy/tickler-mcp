@@ -1,6 +1,6 @@
 {
   "name": "tickler-mcp",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Persistent tickler/reminder MCP server for Claude Code and any MCP client",
   "type": "module",
   "license": "MIT",
@@ -34,7 +34,8 @@
     "prepack": "npm run build",
     "dev": "tsx src/mcp.ts",
     "test": "node --import tsx --test test/*.test.ts",
-    "release": "./scripts/release.sh"
+    "release": "./scripts/release.sh",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
