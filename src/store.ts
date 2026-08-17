@@ -203,7 +203,12 @@ export function normalizeStoredDueDates(db: Database.Database): number {
         .prepare(`SELECT id, due FROM ticklers WHERE due NOT GLOB '${CANONICAL_DUE_GLOB}'`)
         .all() as { id: string; due: string }[];
 
-      // `AND due = @old` is a second guard on the same race.
+      // `AND due = @old` is a second guard on the same race, and is deliberately
+      // unreachable as written: the IMMEDIATE transaction above already makes the
+      // re-SELECT and this UPDATE atomic, so `due` cannot change in between and
+      // no test can drive this predicate to zero rows. It is kept as insurance
+      // against a future change that moves the SELECT back outside the lock —
+      // the mistake this function shipped with once. Do not read it as covered.
       const update = db.prepare(
         "UPDATE ticklers SET due = @due WHERE id = @id AND due = @old"
       );
