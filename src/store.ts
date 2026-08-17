@@ -19,6 +19,69 @@ function getLegacyJsonPath(): string {
   );
 }
 
+/** Matched before `Date.parse`, which would read this shape as UTC midnight. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Canonicalize a due timestamp to UTC-Z (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+ *
+ * Every write path funnels through here so the `due` TEXT column ever holds only
+ * one spelling of an instant. `checkTicklers` compares `due` against
+ * `new Date().toISOString()` using SQLite's lexicographic `<=`, which is a valid
+ * instant comparison only when both sides share a frame of reference (issue #3).
+ *
+ * How each input shape is read — all three are deliberate choices, made here at
+ * the write boundary while the author's intent is still available:
+ *
+ * - **Explicit offset or `Z`** (`2026-08-17T09:00:00-07:00`) — the instant it denotes.
+ * - **Naive** (`2026-08-17T09:00:00`, no offset) — the author's *local* time.
+ *   This is what `new Date()` already does, and it is the right reading: someone
+ *   writing "09:00" means 09:00 where they are.
+ * - **Date-only** (`2026-08-17`) — *local* midnight. ECMA-262 parses date-only
+ *   forms as UTC midnight, which would contradict the naive rule above and, west
+ *   of Greenwich, fire the reminder the previous evening. The CLI's `--due` help
+ *   advertises `YYYY-MM-DD`, so this shape is not hypothetical.
+ *
+ * `due` is typed `unknown` rather than `string` because `runMigration` feeds it
+ * values off an unvalidated `JSON.parse`, where the declared type is a claim
+ * rather than a guarantee.
+ *
+ * @throws {RangeError} when `due` cannot be parsed. Failing loudly at write time
+ * beats storing a string that mis-sorts silently forever.
+ */
+export function normalizeDue(due: unknown): string {
+  if (typeof due !== "string") {
+    throw new RangeError(
+      `Invalid due date ${JSON.stringify(due)} — expected an ISO 8601 string.`
+    );
+  }
+
+  const raw = due.trim();
+
+  if (DATE_ONLY.test(raw)) {
+    const [year, month, day] = raw.split("-").map(Number);
+    const localMidnight = new Date(year, month - 1, day);
+    // `new Date(2026, 1, 30)` rolls over to March 2 rather than throwing, so an
+    // impossible calendar date has to be rejected by reading the parts back.
+    if (
+      localMidnight.getFullYear() !== year ||
+      localMidnight.getMonth() !== month - 1 ||
+      localMidnight.getDate() !== day
+    ) {
+      throw new RangeError(`Invalid due date "${due}" — no such calendar date.`);
+    }
+    return localMidnight.toISOString();
+  }
+
+  const ms = Date.parse(raw);
+  if (Number.isNaN(ms)) {
+    throw new RangeError(
+      `Invalid due date "${due}". Use ISO 8601, e.g. 2026-04-01T09:00:00-07:00.`
+    );
+  }
+  return new Date(ms).toISOString();
+}
+
 let _db: Database.Database | undefined;
 let _dbPath: string | undefined;
 
@@ -46,26 +109,131 @@ function getDb(): Database.Database {
   return _db;
 }
 
+/**
+ * Table definition. Exported so tests that need a raw handle — one that skips
+ * the backfill below, in order to prove the write paths normalize on their own —
+ * cannot drift from the real schema.
+ */
+export const TICKLERS_SCHEMA_SQL = `
+  CREATE TABLE IF NOT EXISTS ticklers (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    body TEXT,
+    due TEXT NOT NULL,
+    creator TEXT,
+    tags TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    snoozed_until TEXT
+  )
+`;
+
 function openDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ticklers (
-      id TEXT PRIMARY KEY,
-      title TEXT NOT NULL,
-      body TEXT,
-      due TEXT NOT NULL,
-      creator TEXT,
-      tags TEXT,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TEXT NOT NULL,
-      completed_at TEXT,
-      snoozed_until TEXT
-    )
-  `);
+  db.exec(TICKLERS_SCHEMA_SQL);
+
+  normalizeStoredDueDates(db);
 
   return db;
+}
+
+/**
+ * Canonical UTC-Z shape, exactly as `toISOString()` emits it. GLOB rather than
+ * LIKE because GLOB is case-sensitive and can assert digits — LIKE would treat a
+ * trailing lowercase `z` as already-canonical and skip a row that needs fixing.
+ *
+ * Kept in sync with `CANONICAL_UTC_Z` in `test/store.test.ts`, which asserts the
+ * same shape as a JS regex. Two dialects, one format — change them together.
+ *
+ * Interpolated into the SQL below rather than bound as a parameter. That is safe
+ * (module constant, no user input, no quote characters) and deliberate: SQLite
+ * can only match a query against a partial index if the pattern is a literal, so
+ * binding it would foreclose the escape hatch described on the function below.
+ */
+const CANONICAL_DUE_GLOB =
+  "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z";
+
+/**
+ * Rewrite any `due` still stored in a pre-normalization format (issue #3).
+ * Exported for testing.
+ *
+ * Runs on every DB open rather than behind a `user_version` gate. Up to 16 MCP
+ * processes share this file, and during a rollout an older binary can write a
+ * legacy row *after* a one-time migration has already fired — a version gate
+ * would never look again, while this check is self-healing.
+ *
+ * `NOT GLOB` is not sargable, so the probe is an O(N) scan that no index on
+ * `due` can help. That is fine at this table's size (measured: 0.2 ms at 1k
+ * rows, 19 ms at 100k) and it runs once per process, not per tool call — but
+ * nothing here ever prunes done rows, so N only grows. If it ever shows up,
+ * the fix is a partial index on the legacy predicate rather than a version gate:
+ *
+ *   CREATE INDEX idx_legacy ON ticklers(id) WHERE due NOT GLOB '<same literal>';
+ *
+ * which SQLite does use (19 ms → 0.0 ms at 100k) and which keeps the check
+ * self-healing.
+ *
+ * Failures are logged and swallowed, including SQLite errors such as
+ * SQLITE_BUSY — which the 16-process concurrency this function exists to survive
+ * makes entirely reachable. A backfill that cannot run right now must not make
+ * the store unopenable for every process; the next open tries again.
+ */
+export function normalizeStoredDueDates(db: Database.Database): number {
+  try {
+    // Unlocked probe first. On a healthy DB this matches nothing and returns
+    // without ever taking a write lock — worth keeping, since this runs on every
+    // open in every process.
+    const needsRepair = db
+      .prepare(`SELECT 1 FROM ticklers WHERE due NOT GLOB '${CANONICAL_DUE_GLOB}' LIMIT 1`)
+      .get();
+    if (needsRepair === undefined) return 0;
+
+    // Repair path. The candidate SELECT is re-run *inside* an immediate
+    // transaction rather than reused from the probe: read outside the write
+    // lock and a concurrent snoozeTickler can land between the read and the
+    // UPDATE, after which this would overwrite the new due with a value derived
+    // from a stale read — resurrecting a fire-early tickler, the exact bug this
+    // code exists to prevent. Taking the lock up front also collapses the
+    // upgrade herd, so one process repairs and the rest find nothing to do.
+    return db.transaction(() => {
+      const candidates = db
+        .prepare(`SELECT id, due FROM ticklers WHERE due NOT GLOB '${CANONICAL_DUE_GLOB}'`)
+        .all() as { id: string; due: string }[];
+
+      // `AND due = @old` is a second guard on the same race, and is deliberately
+      // unreachable as written: the IMMEDIATE transaction above already makes the
+      // re-SELECT and this UPDATE atomic, so `due` cannot change in between and
+      // no test can drive this predicate to zero rows. It is kept as insurance
+      // against a future change that moves the SELECT back outside the lock —
+      // the mistake this function shipped with once. Do not read it as covered.
+      const update = db.prepare(
+        "UPDATE ticklers SET due = @due WHERE id = @id AND due = @old"
+      );
+
+      let changed = 0;
+      for (const row of candidates) {
+        let normalized: string;
+        try {
+          normalized = normalizeDue(row.due);
+        } catch (err) {
+          // Narrowed, so a bug inside normalizeDue cannot masquerade as bad data.
+          if (!(err instanceof RangeError)) throw err;
+          console.error(
+            `tickler-mcp: tickler ${row.id} has an unparseable due "${row.due}" — left as-is.`
+          );
+          continue;
+        }
+        changed += update.run({ id: row.id, due: normalized, old: row.due }).changes;
+      }
+      return changed;
+    }).immediate();
+  } catch (err) {
+    console.error(`tickler-mcp: due-date backfill skipped — ${(err as Error).message}`);
+    return 0;
+  }
 }
 
 /**
@@ -106,12 +274,28 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
   `);
 
   const migrate = db.transaction((rows: Tickler[]) => {
+    let skipped = 0;
     for (const t of rows) {
+      // An unparseable due in legacy JSON must not abort the whole import — but
+      // it must not be swallowed either. Skip the row, count it, and let the
+      // caller decline the rename so the source file stays recoverable.
+      let due: string;
+      try {
+        due = normalizeDue(t.due);
+      } catch (err) {
+        if (!(err instanceof RangeError)) throw err;
+        skipped++;
+        console.error(
+          `tickler-mcp: skipping tickler ${t.id ?? "(no id)"} from ${jsonPath} — ${err.message}`
+        );
+        continue;
+      }
+
       insert.run({
         id: t.id,
         title: t.title,
         body: t.body ?? null,
-        due: t.due,
+        due,
         creator: t.creator ?? null,
         tags: JSON.stringify(Array.isArray(t.tags) ? t.tags : []),
         status: t.status ?? "pending",
@@ -120,9 +304,22 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
         snoozed_until: null,
       });
     }
+    return skipped;
   });
 
-  migrate(ticklers);
+  const skipped = migrate(ticklers);
+
+  // A skipped row means the JSON holds data the DB does not. Renaming it here
+  // would destroy the only copy. Bail out before the count check below — that
+  // check counts every row in the table rather than the ones just imported, so
+  // on a non-empty DB it would happily wave a lossy migration through.
+  if (skipped > 0) {
+    console.error(
+      `tickler-mcp: ${skipped} tickler(s) in ${jsonPath} had an unparseable due date and were ` +
+        `not imported. Leaving the file in place for manual recovery — it will NOT be renamed.`
+    );
+    return;
+  }
 
   // Verify all rows made it in before renaming
   const dbCount = (
@@ -161,7 +358,7 @@ export function createTickler(tickler: Tickler): void {
     id: tickler.id,
     title: tickler.title,
     body: tickler.body ?? null,
-    due: tickler.due,
+    due: normalizeDue(tickler.due),
     creator: tickler.creator ?? null,
     tags: JSON.stringify(tickler.tags ?? []),
     status: tickler.status,
@@ -224,10 +421,14 @@ export function deleteTickler(id: string): boolean {
 
 export function snoozeTickler(id: string, newDue: string): boolean {
   const db = getDb();
+  // Normalize here too, not just in createTickler: a snooze writes `due` exactly
+  // as a create does, and fixing only create leaves the same bug reachable by a
+  // different door while looking identical from the outside.
+  const due = normalizeDue(newDue);
   // Re-open a completed tickler if it is being snoozed
   const result = db.prepare(
     "UPDATE ticklers SET due = @due, status = 'pending', completed_at = NULL WHERE id = @id"
-  ).run({ id, due: newDue });
+  ).run({ id, due });
   return result.changes > 0;
 }
 

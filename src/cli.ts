@@ -12,6 +12,7 @@ import {
   getTickler,
   formatTickler,
   getDbPath,
+  normalizeDue,
 } from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
@@ -63,14 +64,20 @@ program
 program
   .command("create <title>")
   .description('Create a tickler: tickler create "Review PR" --due "2026-04-01T09:00:00-07:00" --tags eng,review')
-  .requiredOption("--due <date>", "Due date (ISO 8601 or YYYY-MM-DD)")
+  .requiredOption(
+    "--due <date>",
+    "Due date (ISO 8601 or YYYY-MM-DD). Stored as UTC; a value with no offset is read as local time"
+  )
   .option("--body <body>", "Details or notes", "")
   .option("--tags <tags>", "Comma-separated tags (e.g. eng,clubexpress)")
   .option("--creator <creator>", "Who is creating this", "cli")
   .action((title: string, opts: { due: string; body: string; tags?: string; creator: string }) => {
-    const dueDate = new Date(opts.due);
-    if (isNaN(dueDate.getTime())) {
-      console.error(`Error: Invalid due date "${opts.due}". Use ISO 8601 format.`);
+    // Normalize up front so the value printed back is the value stored.
+    let due: string;
+    try {
+      due = normalizeDue(opts.due);
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
       process.exit(1);
     }
 
@@ -82,7 +89,7 @@ program
       id: crypto.randomUUID(),
       title,
       body: opts.body,
-      due: opts.due,
+      due,
       tags,
       creator: opts.creator,
       status: "pending",

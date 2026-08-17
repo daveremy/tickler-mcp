@@ -13,6 +13,7 @@ import {
   snoozeTickler,
   getTickler,
   formatTickler,
+  normalizeDue,
 } from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
@@ -25,14 +26,21 @@ server.tool(
   {
     title: z.string().describe("Short title for the reminder"),
     body: z.string().describe("Details or notes for the reminder"),
-    due: z.string().describe("ISO 8601 due date/time (e.g. 2026-04-01T09:00:00-07:00)"),
+    due: z.string().describe(
+      "ISO 8601 due date/time (e.g. 2026-04-01T09:00:00-07:00). Stored as UTC. " +
+        "A timestamp with no offset (2026-04-01T09:00:00) and a bare date (2026-04-01) " +
+        "are both read as the server's LOCAL time — pass an explicit offset to be unambiguous."
+    ),
     tags: z.array(z.string()).optional().describe("Optional tags for filtering (e.g. [\"eng\", \"clubexpress\"])"),
     creator: z.string().optional().describe("Agent or user creating this tickler (e.g. karpathy, marcus)"),
   },
-  async ({ title, body, due, tags = [], creator = "unknown" }) => {
-    const dueDate = new Date(due);
-    if (isNaN(dueDate.getTime())) {
-      return { content: [{ type: "text" as const, text: `Error: Invalid due date "${due}". Use ISO 8601 format.` }], isError: true };
+  async ({ title, body, due: dueInput, tags = [], creator = "unknown" }) => {
+    // Normalize up front so the value echoed back is the value stored.
+    let due: string;
+    try {
+      due = normalizeDue(dueInput);
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
     }
 
     const tickler: Tickler = {
