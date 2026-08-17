@@ -6,8 +6,20 @@ import * as path from "path";
 import * as crypto from "crypto";
 import Database from "better-sqlite3";
 
+/** A unique temp DB path. Declared as a hoisted function so `TEST_DB` can use it. */
+function tmpDbPath(label: string): string {
+  return path.join(os.tmpdir(), `tickler-${label}-${crypto.randomUUID()}.db`);
+}
+
+/** Remove a SQLite DB and its WAL sidecars. */
+function rmDb(dbPath: string): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+  }
+}
+
 // Each test suite gets its own DB file via env var
-const TEST_DB = path.join(os.tmpdir(), `tickler-test-${crypto.randomUUID()}.db`);
+const TEST_DB = tmpDbPath("test");
 process.env.TICKLER_DB_PATH = TEST_DB;
 
 // Import store AFTER setting env var (lazy DB init)
@@ -22,6 +34,7 @@ import {
   runMigration,
   normalizeDue,
   normalizeStoredDueDates,
+  TICKLERS_SCHEMA_SQL,
 } from "../src/store.js";
 import type { Tickler } from "../src/types.js";
 
@@ -40,12 +53,7 @@ function makeTickler(overrides: Partial<Tickler> = {}): Tickler {
   };
 }
 
-after(() => {
-  // Clean up test DB
-  try { fs.unlinkSync(TEST_DB); } catch { /* ignore */ }
-  try { fs.unlinkSync(TEST_DB + "-wal"); } catch { /* ignore */ }
-  try { fs.unlinkSync(TEST_DB + "-shm"); } catch { /* ignore */ }
-});
+after(() => rmDb(TEST_DB));
 
 describe("store: CRUD", () => {
   test("create and retrieve a tickler", () => {
@@ -219,7 +227,7 @@ describe("store: snooze", () => {
 
 describe("store: JSON migration", () => {
   test("imports records from JSON into a fresh SQLite DB", () => {
-    const migrationDb = path.join(os.tmpdir(), `tickler-migration-${crypto.randomUUID()}.db`);
+    const migrationDb = tmpDbPath("migration");
     const legacyJson = path.join(os.tmpdir(), `ticklers-legacy-${crypto.randomUUID()}.json`);
 
     const legacyTicklers: Tickler[] = [
@@ -237,23 +245,21 @@ describe("store: JSON migration", () => {
     assert.ok(!fs.existsSync(legacyJson), "original JSON should no longer exist");
 
     // Clean up
-    try { fs.unlinkSync(migrationDb); } catch { /* ignore */ }
-    try { fs.unlinkSync(migrationDb + "-wal"); } catch { /* ignore */ }
-    try { fs.unlinkSync(migrationDb + "-shm"); } catch { /* ignore */ }
+    rmDb(migrationDb);
     try { fs.unlinkSync(legacyJson + ".migrated"); } catch { /* ignore */ }
   });
 
   test("is a no-op when JSON file does not exist", () => {
-    const migrationDb = path.join(os.tmpdir(), `tickler-noop-${crypto.randomUUID()}.db`);
+    const migrationDb = tmpDbPath("noop");
     const nonExistent = path.join(os.tmpdir(), `nonexistent-${crypto.randomUUID()}.json`);
     // Should not throw
     runMigration(migrationDb, nonExistent);
     // DB may or may not be created — just verify no crash
-    try { fs.unlinkSync(migrationDb); } catch { /* ignore */ }
+    rmDb(migrationDb);
   });
 
   test("skips corrupted JSON and leaves file intact", () => {
-    const migrationDb = path.join(os.tmpdir(), `tickler-corrupt-${crypto.randomUUID()}.db`);
+    const migrationDb = tmpDbPath("corrupt");
     const corruptedJson = path.join(os.tmpdir(), `ticklers-corrupted-${crypto.randomUUID()}.json`);
     fs.writeFileSync(corruptedJson, "{ not valid json");
 
@@ -266,7 +272,7 @@ describe("store: JSON migration", () => {
 
     // Clean up
     fs.unlinkSync(corruptedJson);
-    try { fs.unlinkSync(migrationDb); } catch { /* ignore */ }
+    rmDb(migrationDb);
   });
 });
 
@@ -281,6 +287,7 @@ describe("store: JSON migration", () => {
  * values are therefore *constructed* — from local-time constructors, or by
  * rendering a known instant into a fixed offset frame — never hardcoded.
  */
+/** Same format as `CANONICAL_DUE_GLOB` in src/store.ts — change them together. */
 const CANONICAL_UTC_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -304,27 +311,15 @@ function naiveLocal(d: Date): string {
   );
 }
 
-/** A raw handle with the ticklers schema, bypassing `openDb`'s backfill. */
+/**
+ * A raw handle with the real schema, bypassing `openDb`'s backfill — otherwise
+ * the backfill would normalize seeded rows and hide whether the write path under
+ * test normalizes on its own.
+ */
 function rawDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS ticklers (
-      id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, due TEXT NOT NULL,
-      creator TEXT, tags TEXT, status TEXT NOT NULL DEFAULT 'pending',
-      created_at TEXT NOT NULL, completed_at TEXT, snoozed_until TEXT
-    )
-  `);
+  db.exec(TICKLERS_SCHEMA_SQL);
   return db;
-}
-
-function tmpDbPath(label: string): string {
-  return path.join(os.tmpdir(), `tickler-${label}-${crypto.randomUUID()}.db`);
-}
-
-function rmDb(dbPath: string): void {
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { fs.unlinkSync(dbPath + suffix); } catch { /* ignore */ }
-  }
 }
 
 describe("store: due normalization (issue #3)", () => {
@@ -477,6 +472,35 @@ describe("store: due normalization (issue #3)", () => {
 
       // Idempotent: a second pass must be a no-op.
       assert.equal(normalizeStoredDueDates(db), 0);
+
+      db.close();
+      rmDb(dbPath);
+    });
+
+    test("does not clobber a due that changed after the row was read", () => {
+      // The backfill reads candidates, then writes. Another process can snooze a
+      // tickler in between. If the UPDATE did not guard on the old value it
+      // would overwrite that snooze with a value derived from a stale read —
+      // resurrecting a fire-early tickler, the bug this file exists to prevent.
+      const dbPath = tmpDbPath("backfill-race");
+      const db = rawDb(dbPath);
+
+      const legacy = inOffset(new Date(Date.now() + 86400_000), -7);
+      db.prepare(
+        "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+      ).run("raced", "raced", legacy, new Date().toISOString());
+
+      // Simulate the concurrent write landing between read and write.
+      const snoozedTo = new Date(Date.now() + 9 * 86400_000).toISOString();
+      const update = db.prepare("UPDATE ticklers SET due = @due WHERE id = @id AND due = @old");
+      db.prepare("UPDATE ticklers SET due = ? WHERE id = 'raced'").run(snoozedTo);
+
+      // A stale-read write must not land.
+      const result = update.run({ id: "raced", due: "1999-01-01T00:00:00.000Z", old: legacy });
+      assert.equal(result.changes, 0, "guarded update must not match a row that moved on");
+
+      const due = (db.prepare("SELECT due FROM ticklers WHERE id = 'raced'").get() as { due: string }).due;
+      assert.equal(due, snoozedTo, "the concurrent snooze must survive");
 
       db.close();
       rmDb(dbPath);

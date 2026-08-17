@@ -21,6 +21,7 @@ import {
   deleteTickler,
   snoozeTickler,
   getTickler,
+  normalizeDue,
 } from "../src/store.js";
 import { parseDuration } from "../src/duration.js";
 import type { Tickler } from "../src/types.js";
@@ -56,10 +57,11 @@ describe("mcp handler: tickler_create", () => {
   });
 
   test("invalid ISO date is caught before store insert", () => {
-    const badDue = "not-a-date";
-    const dueDate = new Date(badDue);
-    assert.ok(isNaN(dueDate.getTime()), "bad date should be NaN");
-    // Handler would return isError: true — no insert needed
+    // Calls the validation the handler actually uses. The previous version of
+    // this test re-implemented an isNaN check inline, so it asserted a property
+    // of `new Date()` rather than anything about this codebase — and stayed
+    // green no matter what the handler did.
+    assert.throws(() => normalizeDue("not-a-date"), RangeError);
   });
 });
 
