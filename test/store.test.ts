@@ -34,6 +34,7 @@ import {
   runMigration,
   normalizeDue,
   normalizeStoredDueDates,
+  MAX_LOGGED_ROWS,
   TICKLERS_SCHEMA_SQL,
 } from "../src/store.js";
 import type { Tickler } from "../src/types.js";
@@ -322,6 +323,42 @@ function rawDb(dbPath: string): Database.Database {
   return db;
 }
 
+/**
+ * Collect everything `fn` writes to stderr. The backfill's reporting is a
+ * behaviour with a contract, not decoration, so it is asserted rather than
+ * eyeballed — and capturing it also keeps the test output readable.
+ */
+function captureStderr(fn: () => void): string[] {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+  try {
+    fn();
+  } finally {
+    console.error = original;
+  }
+  return lines;
+}
+
+/**
+ * Same shape as `OFFSET_SUFFIX` in src/store.ts — change them together. Spelled
+ * out here rather than imported, for the same reason `CANONICAL_UTC_Z` above is:
+ * a post-condition asserted with the implementation's own predicate cannot
+ * notice the predicate itself being widened.
+ */
+const OFFSET_SUFFIX_RE = /[+-]\d{2}:\d{2}$/;
+
+/**
+ * An instant a day out with no sub-second component — naive and offset
+ * spellings carry no milliseconds, so a fixture that had them would not
+ * round-trip.
+ */
+function futureInstant(msFromNow = 86400_000): Date {
+  const d = new Date(Date.now() + msFromNow);
+  d.setMilliseconds(0);
+  return d;
+}
+
 describe("store: due normalization (issue #3)", () => {
   test("REGRESSION: a tickler due 2h out with a -07:00 offset does not fire", () => {
     const twoHoursOut = new Date(Date.now() + 2 * 3600_000);
@@ -344,6 +381,85 @@ describe("store: due normalization (issue #3)", () => {
       !fired.some((x) => x.id === t.id),
       "a tickler 2h in the future must not be returned by checkTicklers()"
     );
+  });
+
+  /**
+   * The property the whole fix reduces to: **membership in `checkTicklers()`
+   * depends on the instant, never on how the instant was spelled.**
+   *
+   * Asserted as a grid rather than as one more example, because examples were
+   * hiding a gap. Absence was covered in the offset frame (the regression test
+   * above), presence only in the UTC-Z frame — so a regression that dropped
+   * *every* offset-carrying row would have passed both: absence is what the
+   * first one wants, and the second never supplies an offset.
+   *
+   * The sign of the offset matters too, and this is the subtler half. A past-due
+   * instant rendered at a NEGATIVE offset produces a string that sorts even
+   * earlier, so it fires with or without normalization — a positive control that
+   * proves nothing. `+05:00` is the discriminating case: the same past instant
+   * renders as a string sorting AFTER a UTC-Z now, so an unnormalized store
+   * fails to fire it. Each row below carries the guard that says which of the
+   * two it is, so a fixture that stops exercising the bug fails loudly instead
+   * of going quietly green.
+   *
+   * Everything here asserts `checkTicklers()` directly. Delivery timing is not
+   * observed: a test that waits for a tickler to arrive exercises the comparison
+   * and the notification path together, and a pass proves neither (issue #6,
+   * where a LATE fire was reported that this comparison cannot produce).
+   */
+  describe("checkTicklers membership follows the instant, not the spelling", () => {
+    const spellings: [string, (d: Date) => string][] = [
+      ["UTC-Z", (d) => d.toISOString()],
+      ["-07:00", (d) => inOffset(d, -7)],
+      ["+05:00", (d) => inOffset(d, 5)],
+      ["naive local", naiveLocal],
+    ];
+    const deltas: [string, number][] = [
+      ["2h past", -2 * 3600_000],
+      ["2h future", +2 * 3600_000],
+    ];
+
+    /** Would the RAW string have sorted the wrong way, i.e. does this cell detect the bug? */
+    const discriminates = (due: string, shouldFire: boolean) =>
+      due <= new Date().toISOString() !== shouldFire;
+
+    for (const [spelling, render] of spellings) {
+      for (const [when, delta] of deltas) {
+        const shouldFire = delta < 0;
+        test(`${when}, written as ${spelling} — ${shouldFire ? "fires" : "does not fire"}`, () => {
+          const instant = new Date(Date.now() + delta);
+          instant.setMilliseconds(0);
+          const due = render(instant);
+
+          const t = makeTickler({ title: `grid-${spelling}-${when}`, due });
+          createTickler(t);
+
+          assert.equal(
+            checkTicklers().some((x) => x.id === t.id),
+            shouldFire,
+            `${spelling} spelling of an instant ${when} must ${shouldFire ? "" : "not "}fire ` +
+              `(raw string ${discriminates(due, shouldFire) ? "would" : "would not"} have mis-sorted)`
+          );
+        });
+      }
+    }
+
+    test("the grid contains a cell that detects the bug in each direction", () => {
+      // Without this the grid could quietly degrade into eight consistency
+      // checks that a fully un-normalized store would also pass. Under TZ=UTC
+      // the naive spelling is identical to UTC-Z and detects nothing, which is
+      // exactly the kind of erosion this guards against.
+      const detected = new Set<boolean>();
+      for (const [, render] of spellings) {
+        for (const [, delta] of deltas) {
+          const instant = new Date(Date.now() + delta);
+          instant.setMilliseconds(0);
+          if (discriminates(render(instant), delta < 0)) detected.add(delta < 0);
+        }
+      }
+      assert.ok(detected.has(false), "no cell would wrongly FIRE without normalization");
+      assert.ok(detected.has(true), "no cell would wrongly NOT fire without normalization");
+    });
   });
 
   test("naive, offset and UTC-Z spellings of one instant round-trip identically", () => {
@@ -475,6 +591,329 @@ describe("store: due normalization (issue #3)", () => {
 
       db.close();
       rmDb(dbPath);
+    });
+
+    /**
+     * Issue #6 — the migration has to be able to prove it worked. Counting rows
+     * per stored shape before and after, and asserting the offset-suffixed count
+     * reaches zero, is the verification; "the backfill did not throw" is not.
+     */
+    describe("reporting (issue #6)", () => {
+      /**
+       * Seed a known mix, run the backfill, hand the assertions its stderr.
+       *
+       * Takes the assertion body rather than returning a handle so that the
+       * close and unlink sit in a `finally`: with teardown after the asserts,
+       * every failing test leaks a connection and an orphaned temp DB — and a
+       * failing test is exactly when that happens.
+       */
+      function backfillWith(
+        label: string,
+        seed: (insert: Database.Statement, created: string) => void,
+        body: (lines: string[], db: Database.Database) => void
+      ): void {
+        const dbPath = tmpDbPath(label);
+        const db = rawDb(dbPath);
+        try {
+          const created = new Date().toISOString();
+          const insert = db.prepare(
+            "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+          );
+          seed(insert, created);
+          body(captureStderr(() => normalizeStoredDueDates(db)), db);
+        } finally {
+          db.close();
+          rmDb(dbPath);
+        }
+      }
+
+      const find = (lines: string[], needle: string) =>
+        lines.find((l) => l.includes(needle));
+
+      test("counts rows by shape before, and reports zero offset-suffixed after", () => {
+        const instant = futureInstant();
+        const canonical = instant.toISOString();
+
+        backfillWith(
+          "report-counts",
+          (insert, created) => {
+            insert.run("off-1", "off-1", inOffset(instant, -7), created);
+            insert.run("off-2", "off-2", inOffset(instant, 5), created);
+            insert.run("utc-no-ms", "utc-no-ms", canonical.replace(".000Z", "Z"), created);
+            insert.run("naive-1", "naive-1", naiveLocal(instant), created);
+            insert.run("canonical", "canonical", canonical, created);
+          },
+          (lines, db) => {
+            const before = find(lines, "due backfill —");
+            assert.ok(before, "the backfill must report what it found");
+            assert.match(before, /4 legacy row\(s\)/);
+            assert.match(before, /offset-suffixed 2/);
+            assert.match(before, /non-canonical UTC 1/);
+            assert.match(before, /naive 1/);
+
+            const after = find(lines, "due backfill complete");
+            assert.ok(after, "the backfill must report what it left behind");
+            assert.match(after, /4 rewritten/);
+            assert.match(after, /0 offset-suffixed remaining/);
+            assert.match(after, /0 non-canonical remaining/);
+
+            assert.ok(
+              !find(lines, "MIGRATION INCOMPLETE"),
+              "a clean migration must not claim to be incomplete"
+            );
+
+            // The counts are a claim about the DB, so check the DB too — a
+            // report agreeing with itself is not evidence.
+            const stillOffset = (db.prepare("SELECT due FROM ticklers").all() as { due: string }[])
+              .filter((r) => OFFSET_SUFFIX_RE.test(r.due));
+            assert.equal(stillOffset.length, 0, "no row may still carry a UTC offset");
+          }
+        );
+      });
+
+      test("does not count unparseable junk as a bare-naive timestamp", () => {
+        // "no Z and no offset" is not the same claim as "a timestamp with no
+        // timezone", and the report asserts the second. Counting junk as naive
+        // made the summary line say it was read as local time, which is false
+        // about that row — a wrong statement in the one output whose whole job
+        // is to describe the migration accurately.
+        const instant = futureInstant();
+
+        backfillWith(
+          "report-shapes",
+          (insert, created) => {
+            insert.run("naive-real", "naive-real", naiveLocal(instant), created);
+            insert.run("junk", "junk", "definitely not a date", created);
+          },
+          (lines) => {
+            const before = find(lines, "due backfill —");
+            assert.ok(before);
+            assert.match(before, /naive 1/, "only the real timestamp is naive");
+            assert.match(before, /unrecognized 1/, "the junk row is counted separately");
+
+            // And it must not be described as having been read as local time.
+            assert.ok(
+              !find(lines, 'tickler junk due "definitely not a date" has no timezone'),
+              "an unparseable row was never assigned a timezone — it was left alone"
+            );
+            assert.ok(find(lines, "unparseable"), "it is reported as unparseable instead");
+          }
+        );
+      });
+
+      test("a zoned non-ISO value is not claimed to have been read as local time", () => {
+        // The correction to the correction. Widening the "assumed local"
+        // attribution to cover every unrecognized row swapped one false claim
+        // for another: `Date.parse` DOES read the zone in "… GMT", so calling it
+        // a local-time guess is wrong. We cannot tell the two apart without
+        // reimplementing Date.parse's non-ISO grammar, so the report must not
+        // claim either — it says what it knows and flags the rest as open.
+        const zoned = "Sun, 01 Mar 2026 09:00:00 GMT";
+        assert.equal(
+          normalizeDue(zoned),
+          "2026-03-01T09:00:00.000Z",
+          "fixture must be a value Date.parse accepts WITH its zone, or this proves nothing"
+        );
+
+        backfillWith(
+          "report-zoned",
+          (insert, created) => {
+            insert.run("zoned", "zoned", zoned, created);
+          },
+          (lines) => {
+            const before = find(lines, "due backfill —");
+            assert.ok(before);
+            assert.match(before, /naive 0/, "a zoned value is not naive");
+            assert.match(before, /unrecognized 1/);
+
+            // The attribution wording specifically, not the substring — the
+            // honest-uncertainty line below legitimately contains the phrase
+            // "was assumed local" inside the question it declines to answer.
+            assert.ok(
+              !lines.some((l) => /assumed local, stored as/.test(l)),
+              "nothing here was established to have been assumed local"
+            );
+            const line = find(lines, "zoned");
+            assert.ok(line, "the row must still be named — silence is the other failure");
+            assert.match(line, /not ISO 8601/);
+            assert.match(line, /not determined here/, "the zone question is stated as open");
+            assert.ok(line.includes("2026-03-01T09:00:00.000Z"), "and the instant it landed on");
+          }
+        );
+      });
+
+      test("names every row whose timezone was assumed rather than read", () => {
+        const instant = futureInstant();
+
+        backfillWith(
+          "report-naive",
+          (insert, created) => {
+            insert.run("guessed", "guessed", naiveLocal(instant), created);
+            insert.run("known", "known", inOffset(instant, -7), created);
+          },
+          (lines) => {
+            const attributed = find(lines, "guessed");
+            assert.ok(attributed, "a row read as local time must be named, not just counted");
+            assert.match(attributed, /no timezone/);
+            assert.ok(
+              attributed.includes(instant.toISOString()),
+              "the line must say what the guess resolved to"
+            );
+
+            // The offset row was read, not guessed at, so it must NOT be reported
+            // as an assumption — otherwise the signal stops meaning anything.
+            assert.ok(!find(lines, "known"), "a row with an explicit offset is not a guess");
+          }
+        );
+      });
+
+      test("an unrepairable offset row leaves the migration incomplete, loudly", () => {
+        const bad = "2026-13-45T00:00:00-07:00"; // offset-suffixed AND unparseable
+        assert.throws(
+          () => normalizeDue(bad),
+          RangeError,
+          "test input must actually be unrepairable or this proves nothing"
+        );
+
+        const instant = futureInstant();
+
+        backfillWith(
+          "report-incomplete",
+          (insert, created) => {
+            insert.run("stuck", "stuck", bad, created);
+            insert.run("fine", "fine", inOffset(instant, -7), created);
+          },
+          (lines, db) => {
+            const after = find(lines, "due backfill complete");
+            assert.ok(after);
+            assert.match(after, /1 rewritten/);
+            assert.match(after, /1 offset-suffixed remaining/);
+
+            const alarm = find(lines, "MIGRATION INCOMPLETE");
+            assert.ok(alarm, "a surviving offset row must not look like a successful migration");
+            assert.match(alarm, /1 row\(s\) still carry a UTC offset/);
+            assert.ok(find(lines, "stuck"), "the row that could not be repaired must be named");
+
+            // The repairable row was still repaired — partial success is not
+            // rolled back just because one row could not be saved.
+            const fine = db
+              .prepare("SELECT due FROM ticklers WHERE id = 'fine'")
+              .get() as { due: string };
+            assert.equal(fine.due, instant.toISOString());
+          }
+        );
+      });
+
+      test("per-row logging is capped so a large legacy DB cannot flood stderr", () => {
+        const extra = 5;
+        const total = MAX_LOGGED_ROWS + extra;
+        const base = futureInstant();
+        base.setSeconds(0); // each row a distinct whole minute, so none collide
+
+        backfillWith(
+          "report-cap",
+          (insert, created) => {
+            for (let i = 0; i < total; i++) {
+              const d = new Date(base.getTime() + i * 60_000);
+              insert.run(`naive-${i}`, `naive-${i}`, naiveLocal(d), created);
+            }
+          },
+          (lines) => {
+            const perRow = lines.filter((l) => l.includes("has no timezone"));
+            assert.equal(perRow.length, MAX_LOGGED_ROWS, "per-row attribution must stop at the cap");
+
+            assert.ok(
+              find(lines, `and ${extra} more`),
+              "withheld rows must be acknowledged, not silently dropped"
+            );
+
+            // Truncating the attribution must not truncate the counts.
+            const before = find(lines, "due backfill —");
+            assert.ok(before);
+            assert.match(before, new RegExp(`${total} legacy row\\(s\\)`));
+            assert.match(before, new RegExp(`naive ${total}`));
+
+            const after = find(lines, "due backfill complete");
+            assert.ok(after);
+            assert.match(after, new RegExp(`${total} rewritten`));
+          }
+        );
+      });
+
+      test("a process that finds no work says nothing at all", () => {
+        // The user-visible contract, and the reason the guard exists: the real
+        // upgrade shape is 16 MCP processes opening one DB, and reporting a
+        // no-op open would print up to 15 "0 legacy row(s) … 0 rewritten"
+        // backfills for a single real migration.
+        //
+        // ⚠️ Read what this covers. Once the winner has committed, the loser
+        // exits at the unlocked probe, so this exercises the PROBE's early
+        // return — not the `candidates === 0` guard after the transaction. That
+        // guard covers the narrower interleaving where a process clears the
+        // probe *before* the winner commits and only then takes the lock, which
+        // is not drivable from a synchronous test: better-sqlite3 gives no way
+        // to run the winner's commit inside the loser's probe-to-transaction
+        // window. Both branches produce the silence asserted here; only one of
+        // them is executed by this test. Do not read the other as covered.
+        // (Same honesty as the note on the `AND due = @old` guard in
+        // src/store.ts, which is likewise correct and likewise unreachable.)
+        const dbPath = tmpDbPath("report-race");
+        const first = rawDb(dbPath);
+        const second = new Database(dbPath);
+
+        try {
+          first
+            .prepare(
+              "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+            )
+            .run("raced", "raced", inOffset(futureInstant(), -7), new Date().toISOString());
+
+          const winner = captureStderr(() => normalizeStoredDueDates(first));
+          assert.ok(find(winner, "1 rewritten"), "the winner reports its migration");
+
+          const loser = captureStderr(() => normalizeStoredDueDates(second));
+          assert.deepEqual(loser, [], "a process that found no work must say nothing at all");
+        } finally {
+          second.close();
+          first.close();
+          rmDb(dbPath);
+        }
+      });
+
+      test("a rolled-back repair reports nothing — no log may claim a reverted write", () => {
+        // The report is emitted after the transaction commits, so a rollback
+        // must leave no "rewritten" claim behind. Driven by holding the write
+        // lock from a second connection, the same way the busy test above does.
+        const dbPath = tmpDbPath("report-rollback");
+        const owner = rawDb(dbPath);
+        const other = new Database(dbPath);
+        other.pragma("busy_timeout = 50");
+
+        try {
+          const legacy = inOffset(futureInstant(), -7);
+          owner
+            .prepare(
+              "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+            )
+            .run("blocked", "blocked", legacy, new Date().toISOString());
+
+          owner.exec("BEGIN IMMEDIATE");
+          let lines: string[];
+          try {
+            lines = captureStderr(() => normalizeStoredDueDates(other));
+          } finally {
+            owner.exec("ROLLBACK");
+          }
+
+          assert.ok(!find(lines, "rewritten"), "a repair that never committed must not claim one");
+          assert.ok(!find(lines, "due backfill —"), "nor report counts for work it did not do");
+          assert.ok(find(lines, "backfill skipped"), "it must say it gave up, not stay silent");
+        } finally {
+          other.close();
+          owner.close();
+          rmDb(dbPath);
+        }
+      });
     });
 
     test("a backfill blocked by another writer fails safe instead of throwing", () => {
