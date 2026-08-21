@@ -441,6 +441,15 @@ export function normalizeStoredDueDates(db: Database.Database): number {
       return r;
     }).immediate();
 
+    // Losing the repair race is a non-event, not a migration. Several processes
+    // can clear the unlocked probe before the first one commits; each then takes
+    // the lock in turn and finds the work already done. That is the herd
+    // collapsing exactly as intended — but reporting it would print up to 15
+    // "0 legacy row(s) … 0 rewritten" backfills for one real migration, which
+    // reads as fifteen migrations that found nothing rather than one that
+    // succeeded.
+    if (report.candidates === 0) return 0;
+
     // Printed only once the transaction has committed. Inside it, any rollback
     // would leave stderr claiming rows were rewritten that were reverted.
     reportRepair(report);

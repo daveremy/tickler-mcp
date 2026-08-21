@@ -840,6 +840,36 @@ describe("store: due normalization (issue #3)", () => {
         );
       });
 
+      test("losing the repair race reports nothing — 16 processes, one migration", () => {
+        // The real upgrade shape: every MCP process opens the DB, so several
+        // clear the unlocked probe before the first commits, then take the lock
+        // in turn and find the work done. Reporting that would print up to 15
+        // "0 legacy row(s) … 0 rewritten" backfills for one real migration.
+        const dbPath = tmpDbPath("report-race");
+        const first = rawDb(dbPath);
+        const second = new Database(dbPath);
+
+        try {
+          first
+            .prepare(
+              "INSERT INTO ticklers (id, title, due, status, created_at) VALUES (?, ?, ?, 'pending', ?)"
+            )
+            .run("raced", "raced", inOffset(futureInstant(), -7), new Date().toISOString());
+
+          const winner = captureStderr(() => normalizeStoredDueDates(first));
+          assert.ok(find(winner, "1 rewritten"), "the winner reports its migration");
+
+          // The loser's probe already passed before the winner committed; here it
+          // reaches the lock and finds nothing left to do.
+          const loser = captureStderr(() => normalizeStoredDueDates(second));
+          assert.deepEqual(loser, [], "a process that found no work must say nothing at all");
+        } finally {
+          second.close();
+          first.close();
+          rmDb(dbPath);
+        }
+      });
+
       test("a rolled-back repair reports nothing — no log may claim a reverted write", () => {
         // The report is emitted after the transaction commits, so a rollback
         // must leave no "rewritten" claim behind. Driven by holding the write
