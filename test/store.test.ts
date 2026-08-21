@@ -701,6 +701,47 @@ describe("store: due normalization (issue #3)", () => {
         );
       });
 
+      test("a zoned non-ISO value is not claimed to have been read as local time", () => {
+        // The correction to the correction. Widening the "assumed local"
+        // attribution to cover every unrecognized row swapped one false claim
+        // for another: `Date.parse` DOES read the zone in "… GMT", so calling it
+        // a local-time guess is wrong. We cannot tell the two apart without
+        // reimplementing Date.parse's non-ISO grammar, so the report must not
+        // claim either — it says what it knows and flags the rest as open.
+        const zoned = "Sun, 01 Mar 2026 09:00:00 GMT";
+        assert.equal(
+          normalizeDue(zoned),
+          "2026-03-01T09:00:00.000Z",
+          "fixture must be a value Date.parse accepts WITH its zone, or this proves nothing"
+        );
+
+        backfillWith(
+          "report-zoned",
+          (insert, created) => {
+            insert.run("zoned", "zoned", zoned, created);
+          },
+          (lines) => {
+            const before = find(lines, "due backfill —");
+            assert.ok(before);
+            assert.match(before, /naive 0/, "a zoned value is not naive");
+            assert.match(before, /unrecognized 1/);
+
+            // The attribution wording specifically, not the substring — the
+            // honest-uncertainty line below legitimately contains the phrase
+            // "was assumed local" inside the question it declines to answer.
+            assert.ok(
+              !lines.some((l) => /assumed local, stored as/.test(l)),
+              "nothing here was established to have been assumed local"
+            );
+            const line = find(lines, "zoned");
+            assert.ok(line, "the row must still be named — silence is the other failure");
+            assert.match(line, /not ISO 8601/);
+            assert.match(line, /not determined here/, "the zone question is stated as open");
+            assert.ok(line.includes("2026-03-01T09:00:00.000Z"), "and the instant it landed on");
+          }
+        );
+      });
+
       test("names every row whose timezone was assumed rather than read", () => {
         const instant = futureInstant();
 

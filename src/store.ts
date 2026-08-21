@@ -208,17 +208,24 @@ function classifyDue(due: string): DueShape {
 }
 
 /**
- * Whether normalizing this row had to *guess* its timezone rather than read one.
+ * `unrecognized` is reported as its own thing rather than folded into either
+ * neighbour, because for those rows we genuinely **do not know** whether a
+ * timezone was read or assumed, and both available lies were tried first:
  *
- * Deliberately broader than `shape === "naive"`. `Date.parse` accepts plenty of
- * non-ISO spellings — `"March 1, 2026 09:00"` — and reads them as local time
- * exactly as it reads a naive ISO value. Those land in `unrecognized`, so keying
- * the attribution off `naive` alone would silently omit the rows whose timezone
- * was *most* speculatively assigned.
+ * - Calling them naive claims their timezone was assumed. False for the ones
+ *   that carry a zone `Date.parse` understands — `Sun, 01 Mar 2026 09:00:00 GMT`,
+ *   or an offset written without a colon as `+0500`.
+ * - Leaving them out of the attribution claims their timezone was read. False
+ *   for `March 1, 2026 09:00`, which `Date.parse` resolves as local time exactly
+ *   as it resolves a naive ISO value — and those are the rows whose timezone was
+ *   assigned most speculatively of all.
+ *
+ * Deciding it properly means reimplementing the set of spellings `Date.parse`
+ * accepts, which is implementation-defined outside the ISO subset. So the report
+ * states what it actually knows — the raw value and the instant it resolved to —
+ * and says the zone question is undetermined. An honest "unknown" beats a
+ * confident answer in either direction.
  */
-function timezoneWasAssumed(shape: DueShape): boolean {
-  return shape === "naive" || shape === "unrecognized";
-}
 
 /**
  * What one repair pass did, as a value.
@@ -242,6 +249,8 @@ interface RepairReport {
   offsetsLeft: number;
   assumedLocal: string[];
   assumedLocalTotal: number;
+  unrecognizedRows: string[];
+  unrecognizedTotal: number;
   unparseable: string[];
   unparseableTotal: number;
 }
@@ -263,9 +272,10 @@ function reportRepair(r: RepairReport): void {
     `tickler-mcp: due backfill — ${r.candidates} legacy row(s) ` +
       `(offset-suffixed ${r.before.offset}, non-canonical UTC ${r.before.utc}, ` +
       `naive ${r.before.naive}, unrecognized ${r.before.unrecognized}). ` +
-      `Naive and unrecognized values carry no timezone and are read as LOCAL time.`
+      `Naive values carry no timezone and are read as LOCAL time.`
   );
   emitCapped(r.assumedLocal, r.assumedLocalTotal, "naive row(s) read as local time");
+  emitCapped(r.unrecognizedRows, r.unrecognizedTotal, "row(s) in an unrecognized format");
   emitCapped(r.unparseable, r.unparseableTotal, "unparseable row(s) left as-is");
   console.error(
     `tickler-mcp: due backfill complete — ${r.changed} rewritten, ` +
@@ -372,6 +382,8 @@ export function normalizeStoredDueDates(db: Database.Database): number {
         offsetsLeft: 0,
         assumedLocal: [],
         assumedLocalTotal: 0,
+        unrecognizedRows: [],
+        unrecognizedTotal: 0,
         unparseable: [],
         unparseableTotal: 0,
       };
@@ -395,12 +407,22 @@ export function normalizeStoredDueDates(db: Database.Database): number {
         }
 
         // Named individually: this row's timezone was assumed, not read.
-        if (timezoneWasAssumed(shape)) {
+        if (shape === "naive") {
           r.assumedLocalTotal += 1;
           pushCapped(
             r.assumedLocal,
             `tickler-mcp: tickler ${row.id} due "${row.due}" has no timezone — ` +
               `assumed local, stored as ${normalized}.`
+          );
+        } else if (shape === "unrecognized") {
+          // Stated as an open question, not as a fact in either direction — see
+          // the note on `unrecognized` above.
+          r.unrecognizedTotal += 1;
+          pushCapped(
+            r.unrecognizedRows,
+            `tickler-mcp: tickler ${row.id} due "${row.due}" is not ISO 8601 — ` +
+              `Date.parse read it as ${normalized}. Whether that spelling carried a ` +
+              `timezone or was assumed local is not determined here; check it.`
           );
         }
 

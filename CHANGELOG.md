@@ -24,9 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   opened. Idempotent and self-healing.
 - The backfill now reports itself ([#6](https://github.com/daveremy/tickler-mcp/issues/6)). On the
   repair path it prints counts by stored shape before and after (`offset-suffixed`, non-canonical
-  `utc`, `naive`, `unrecognized`), names every row whose timezone was assumed rather than read (such
-  a `due` has none to recover, so reading it as local is a guess and an unattributable guess is
-  worse than a loud one), and reports the surviving offset-suffixed
+  `utc`, `naive`, `unrecognized`), names every row whose timezone was assumed rather than read (a
+  naive `due` has none to recover, so reading it as local is a guess and an unattributable guess is
+  worse than a loud one), names every row in a format it does not recognize without claiming to know
+  whether that spelling carried a zone, and reports the surviving offset-suffixed
   count — shouting `MIGRATION INCOMPLETE` if it is nonzero. Per-row lines are capped at 20 so a
   large legacy database cannot flood stderr; the counts themselves are never truncated. A healthy
   database still prints nothing and takes no write lock.
