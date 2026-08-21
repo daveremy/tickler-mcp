@@ -840,11 +840,23 @@ describe("store: due normalization (issue #3)", () => {
         );
       });
 
-      test("losing the repair race reports nothing — 16 processes, one migration", () => {
-        // The real upgrade shape: every MCP process opens the DB, so several
-        // clear the unlocked probe before the first commits, then take the lock
-        // in turn and find the work done. Reporting that would print up to 15
-        // "0 legacy row(s) … 0 rewritten" backfills for one real migration.
+      test("a process that finds no work says nothing at all", () => {
+        // The user-visible contract, and the reason the guard exists: the real
+        // upgrade shape is 16 MCP processes opening one DB, and reporting a
+        // no-op open would print up to 15 "0 legacy row(s) … 0 rewritten"
+        // backfills for a single real migration.
+        //
+        // ⚠️ Read what this covers. Once the winner has committed, the loser
+        // exits at the unlocked probe, so this exercises the PROBE's early
+        // return — not the `candidates === 0` guard after the transaction. That
+        // guard covers the narrower interleaving where a process clears the
+        // probe *before* the winner commits and only then takes the lock, which
+        // is not drivable from a synchronous test: better-sqlite3 gives no way
+        // to run the winner's commit inside the loser's probe-to-transaction
+        // window. Both branches produce the silence asserted here; only one of
+        // them is executed by this test. Do not read the other as covered.
+        // (Same honesty as the note on the `AND due = @old` guard in
+        // src/store.ts, which is likewise correct and likewise unreachable.)
         const dbPath = tmpDbPath("report-race");
         const first = rawDb(dbPath);
         const second = new Database(dbPath);
@@ -859,8 +871,6 @@ describe("store: due normalization (issue #3)", () => {
           const winner = captureStderr(() => normalizeStoredDueDates(first));
           assert.ok(find(winner, "1 rewritten"), "the winner reports its migration");
 
-          // The loser's probe already passed before the winner committed; here it
-          // reaches the lock and finds nothing left to do.
           const loser = captureStderr(() => normalizeStoredDueDates(second));
           assert.deepEqual(loser, [], "a process that found no work must say nothing at all");
         } finally {
