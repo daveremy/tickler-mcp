@@ -157,6 +157,50 @@ const CANONICAL_DUE_GLOB =
   "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z";
 
 /**
+ * A trailing `±HH:MM`. The backfill's post-condition is stated in terms of this
+ * shape specifically, because it is the one that mis-sorts *silently*: it parses
+ * fine, renders fine, and compares wrong. A surviving row of this shape is a
+ * failed migration; a surviving unparseable row is merely bad input.
+ */
+const OFFSET_SUFFIX = /[+-]\d{2}:\d{2}$/;
+
+/**
+ * Per-row log lines are capped so that a large legacy database cannot turn a
+ * migration into an unbounded write to stderr. Beyond the cap the counts still
+ * report in full — only the row-by-row attribution is truncated.
+ */
+const MAX_LOGGED_ROWS = 20;
+
+/** Shape a legacy `due` was stored in, for the before/after migration counts. */
+type DueShape = "offset" | "utc" | "naive";
+
+function classifyDue(due: string): DueShape {
+  if (OFFSET_SUFFIX.test(due)) return "offset";
+  if (due.endsWith("Z")) return "utc";
+  return "naive";
+}
+
+/**
+ * Emits at most `MAX_LOGGED_ROWS` lines, then one line saying how many were
+ * withheld. Returns a logger rather than taking an array so callers can report
+ * rows as they are processed instead of buffering them.
+ */
+function cappedLogger(suffix: string): { log: (line: string) => void; done: () => void } {
+  let seen = 0;
+  return {
+    log(line: string) {
+      seen += 1;
+      if (seen <= MAX_LOGGED_ROWS) console.error(line);
+    },
+    done() {
+      if (seen > MAX_LOGGED_ROWS) {
+        console.error(`tickler-mcp: … and ${seen - MAX_LOGGED_ROWS} more ${suffix}.`);
+      }
+    },
+  };
+}
+
+/**
  * Rewrite any `due` still stored in a pre-normalization format (issue #3).
  * Exported for testing.
  *
@@ -180,6 +224,32 @@ const CANONICAL_DUE_GLOB =
  * SQLITE_BUSY — which the 16-process concurrency this function exists to survive
  * makes entirely reachable. A backfill that cannot run right now must not make
  * the store unopenable for every process; the next open tries again.
+ *
+ * ## Reporting (issue #6)
+ *
+ * The repair path prints before/after counts by stored shape, and names every
+ * row that took the naive → local-time fallback. A naive `due` carries no
+ * recoverable timezone, so reading it as local is a *guess* — a defensible one,
+ * made where the author's intent still existed, but a guess. An unattributable
+ * guess is the failure mode this codebase names most often: an unknown value
+ * resolving quietly to a default with no error anywhere. Counts alone cannot say
+ * *which* row was guessed at, so the rows are named too, up to `MAX_LOGGED_ROWS`.
+ *
+ * The post-condition — zero offset-suffixed rows remaining — is **reported, not
+ * enforced**. Deliberate, and the alternatives are worse:
+ *
+ * - *Throwing* would break this function's contract above: it runs inside
+ *   `openDb()`, so an exception makes the store unopenable for that process.
+ * - *Rolling back* would revert rows that were successfully repaired, returning
+ *   them to the fire-early state this code exists to end — converting a partial
+ *   success into a total failure with the same input waiting at the next open.
+ *
+ * A row can only survive the rewrite if `normalizeDue()` rejects it, i.e. it is
+ * unparseable and no retry can fix it. So the useful action is to repair
+ * everything repairable and make what is left *loud*, which is what this does.
+ *
+ * All output goes to stderr. The MCP server speaks JSON-RPC over stdout, and a
+ * stray log line there corrupts the protocol.
  */
 export function normalizeStoredDueDates(db: Database.Database): number {
   try {
@@ -213,6 +283,17 @@ export function normalizeStoredDueDates(db: Database.Database): number {
         "UPDATE ticklers SET due = @due WHERE id = @id AND due = @old"
       );
 
+      const before = { offset: 0, utc: 0, naive: 0 };
+      for (const row of candidates) before[classifyDue(row.due)] += 1;
+      console.error(
+        `tickler-mcp: due backfill — ${candidates.length} legacy row(s) ` +
+          `(offset-suffixed ${before.offset}, non-canonical UTC ${before.utc}, naive ${before.naive}). ` +
+          `Naive values carry no timezone and are read as LOCAL time.`
+      );
+
+      const naiveLog = cappedLogger("naive row(s) read as local time");
+      const badLog = cappedLogger("unparseable row(s) left as-is");
+
       let changed = 0;
       for (const row of candidates) {
         let normalized: string;
@@ -221,13 +302,44 @@ export function normalizeStoredDueDates(db: Database.Database): number {
         } catch (err) {
           // Narrowed, so a bug inside normalizeDue cannot masquerade as bad data.
           if (!(err instanceof RangeError)) throw err;
-          console.error(
+          badLog.log(
             `tickler-mcp: tickler ${row.id} has an unparseable due "${row.due}" — left as-is.`
           );
           continue;
         }
+        // Named individually: this row's timezone was assumed, not read.
+        if (classifyDue(row.due) === "naive") {
+          naiveLog.log(
+            `tickler-mcp: tickler ${row.id} due "${row.due}" has no timezone — ` +
+              `assumed local, stored as ${normalized}.`
+          );
+        }
         changed += update.run({ id: row.id, due: normalized, old: row.due }).changes;
       }
+      naiveLog.done();
+      badLog.done();
+
+      // After-counts, read back from the DB inside the same transaction rather
+      // than derived from the loop above: a count computed from what we believe
+      // we wrote cannot detect that a write did not land. "No errors" is not
+      // evidence a migration worked.
+      const remaining = db
+        .prepare(`SELECT due FROM ticklers WHERE due NOT GLOB '${CANONICAL_DUE_GLOB}'`)
+        .all() as { due: string }[];
+      const offsetsLeft = remaining.filter((r) => OFFSET_SUFFIX.test(r.due)).length;
+
+      console.error(
+        `tickler-mcp: due backfill complete — ${changed} rewritten, ` +
+          `${offsetsLeft} offset-suffixed remaining, ${remaining.length} non-canonical remaining.`
+      );
+      if (offsetsLeft > 0) {
+        console.error(
+          `tickler-mcp: MIGRATION INCOMPLETE — ${offsetsLeft} row(s) still carry a UTC offset ` +
+            `and will compare incorrectly against a UTC-Z now (issue #6). See the unparseable ` +
+            `rows logged above.`
+        );
+      }
+
       return changed;
     }).immediate();
   } catch (err) {
