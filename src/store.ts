@@ -185,13 +185,39 @@ const LEGACY_DUE_WHERE = `due NOT GLOB '${CANONICAL_DUE_GLOB}'`;
  */
 export const MAX_LOGGED_ROWS = 20;
 
+/**
+ * An ISO 8601 date or date-time carrying no zone designator: `2026-08-17`,
+ * `2026-08-17T09:00`, `2026-08-17T09:00:00`, `…:00.5`.
+ *
+ * Needed because "has no `Z` and no offset" is not the same claim as "is a
+ * timestamp with no timezone" — `"definitely not a date"` satisfies the first
+ * and none of the second. Without this the report counted junk as bare-naive and
+ * announced it was "read as LOCAL time", which is false about those rows in the
+ * one output whose entire job is to be accurate about what the migration did.
+ */
+const NAIVE_TIMESTAMP = /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?$/;
+
 /** Shape a legacy `due` was stored in, for the before/after migration counts. */
-type DueShape = "offset" | "utc" | "naive";
+type DueShape = "offset" | "utc" | "naive" | "unrecognized";
 
 function classifyDue(due: string): DueShape {
   if (OFFSET_SUFFIX.test(due)) return "offset";
   if (due.endsWith("Z")) return "utc";
-  return "naive";
+  if (NAIVE_TIMESTAMP.test(due)) return "naive";
+  return "unrecognized";
+}
+
+/**
+ * Whether normalizing this row had to *guess* its timezone rather than read one.
+ *
+ * Deliberately broader than `shape === "naive"`. `Date.parse` accepts plenty of
+ * non-ISO spellings — `"March 1, 2026 09:00"` — and reads them as local time
+ * exactly as it reads a naive ISO value. Those land in `unrecognized`, so keying
+ * the attribution off `naive` alone would silently omit the rows whose timezone
+ * was *most* speculatively assigned.
+ */
+function timezoneWasAssumed(shape: DueShape): boolean {
+  return shape === "naive" || shape === "unrecognized";
 }
 
 /**
@@ -235,8 +261,9 @@ function emitCapped(sample: string[], total: number, suffix: string): void {
 function reportRepair(r: RepairReport): void {
   console.error(
     `tickler-mcp: due backfill — ${r.candidates} legacy row(s) ` +
-      `(offset-suffixed ${r.before.offset}, non-canonical UTC ${r.before.utc}, naive ${r.before.naive}). ` +
-      `Naive values carry no timezone and are read as LOCAL time.`
+      `(offset-suffixed ${r.before.offset}, non-canonical UTC ${r.before.utc}, ` +
+      `naive ${r.before.naive}, unrecognized ${r.before.unrecognized}). ` +
+      `Naive and unrecognized values carry no timezone and are read as LOCAL time.`
   );
   emitCapped(r.assumedLocal, r.assumedLocalTotal, "naive row(s) read as local time");
   emitCapped(r.unparseable, r.unparseableTotal, "unparseable row(s) left as-is");
@@ -340,7 +367,7 @@ export function normalizeStoredDueDates(db: Database.Database): number {
       const r: RepairReport = {
         changed: 0,
         candidates: candidates.length,
-        before: { offset: 0, utc: 0, naive: 0 },
+        before: { offset: 0, utc: 0, naive: 0, unrecognized: 0 },
         remaining: 0,
         offsetsLeft: 0,
         assumedLocal: [],
@@ -368,7 +395,7 @@ export function normalizeStoredDueDates(db: Database.Database): number {
         }
 
         // Named individually: this row's timezone was assumed, not read.
-        if (shape === "naive") {
+        if (timezoneWasAssumed(shape)) {
           r.assumedLocalTotal += 1;
           pushCapped(
             r.assumedLocal,

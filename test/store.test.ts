@@ -671,6 +671,36 @@ describe("store: due normalization (issue #3)", () => {
         );
       });
 
+      test("does not count unparseable junk as a bare-naive timestamp", () => {
+        // "no Z and no offset" is not the same claim as "a timestamp with no
+        // timezone", and the report asserts the second. Counting junk as naive
+        // made the summary line say it was read as local time, which is false
+        // about that row — a wrong statement in the one output whose whole job
+        // is to describe the migration accurately.
+        const instant = futureInstant();
+
+        backfillWith(
+          "report-shapes",
+          (insert, created) => {
+            insert.run("naive-real", "naive-real", naiveLocal(instant), created);
+            insert.run("junk", "junk", "definitely not a date", created);
+          },
+          (lines) => {
+            const before = find(lines, "due backfill —");
+            assert.ok(before);
+            assert.match(before, /naive 1/, "only the real timestamp is naive");
+            assert.match(before, /unrecognized 1/, "the junk row is counted separately");
+
+            // And it must not be described as having been read as local time.
+            assert.ok(
+              !find(lines, 'tickler junk due "definitely not a date" has no timezone'),
+              "an unparseable row was never assigned a timezone — it was left alone"
+            );
+            assert.ok(find(lines, "unparseable"), "it is reported as unparseable instead");
+          }
+        );
+      });
+
       test("names every row whose timezone was assumed rather than read", () => {
         const instant = futureInstant();
 
