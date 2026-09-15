@@ -2,7 +2,10 @@ import Database from "better-sqlite3";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as crypto from "crypto";
 import type { Tickler } from "./types.js";
+import type { Recur } from "./recur.js";
+import { formatRecur, nextFutureOccurrence } from "./recur.js";
 
 // Resolved lazily at each call so tests can set TICKLER_DB_PATH before importing.
 export function getDbPath(): string {
@@ -125,15 +128,30 @@ export const TICKLERS_SCHEMA_SQL = `
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
     completed_at TEXT,
-    snoozed_until TEXT
+    snoozed_until TEXT,
+    recur TEXT
   )
 `;
+
+/**
+ * `recur` is the first column added to an already-shipped schema, so unlike every other
+ * column (present since before any real DB existed) it needs an explicit, idempotent
+ * migration guard rather than relying on `CREATE TABLE IF NOT EXISTS`, which does nothing
+ * to a table that already exists without the new column.
+ */
+export function ensureRecurColumn(db: Database.Database): void {
+  const columns = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+  if (!columns.some((c) => c.name === "recur")) {
+    db.exec("ALTER TABLE ticklers ADD COLUMN recur TEXT");
+  }
+}
 
 function openDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
 
   db.exec(TICKLERS_SCHEMA_SQL);
+  ensureRecurColumn(db);
 
   normalizeStoredDueDates(db);
 
@@ -269,8 +287,8 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
   const ticklers = Array.isArray(parsed.ticklers) ? parsed.ticklers : [];
 
   const insert = db.prepare(`
-    INSERT OR IGNORE INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until)
-    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until)
+    INSERT OR IGNORE INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur)
+    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur)
   `);
 
   const migrate = db.transaction((rows: Tickler[]) => {
@@ -302,6 +320,7 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
         created_at: t.createdAt ?? new Date().toISOString(),
         completed_at: t.completedAt ?? null,
         snoozed_until: null,
+        recur: t.recur ? JSON.stringify(t.recur) : null,
       });
     }
     return skipped;
@@ -346,14 +365,15 @@ function rowToTickler(row: Record<string, unknown>): Tickler {
     status: row.status as "pending" | "done",
     createdAt: row.created_at as string,
     completedAt: (row.completed_at as string | null) ?? null,
+    recur: row.recur ? (JSON.parse(row.recur as string) as Recur) : null,
   };
 }
 
 export function createTickler(tickler: Tickler): void {
   const db = getDb();
   db.prepare(`
-    INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until)
-    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until)
+    INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur)
+    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur)
   `).run({
     id: tickler.id,
     title: tickler.title,
@@ -365,6 +385,7 @@ export function createTickler(tickler: Tickler): void {
     created_at: tickler.createdAt,
     completed_at: tickler.completedAt ?? null,
     snoozed_until: null,
+    recur: tickler.recur ? JSON.stringify(tickler.recur) : null,
   });
 }
 
@@ -404,13 +425,56 @@ export function checkTicklers(): Tickler[] {
   return rows.map(rowToTickler);
 }
 
-export function completeTickler(id: string): boolean {
+export interface CompleteResult {
+  completed: boolean;
+  /** Present only when the completed tickler was recurring and a successor was created. */
+  nextId?: string;
+  nextDue?: string;
+}
+
+/**
+ * Mark a tickler done. If it was recurring, atomically create the next pending occurrence
+ * (never in the past, skipping any missed slots) and return its id.
+ *
+ * The completion UPDATE is guarded with `AND status = 'pending'` and its `changes` count is
+ * what decides whether a successor gets created — so completing an already-done tickler
+ * twice (a race, a retry) is a no-op the second time, never a duplicate successor. Both the
+ * completion and the successor insert run inside one `db.transaction()`, so a crash between
+ * them can never leave a completed series with no next occurrence.
+ */
+export function completeTickler(id: string): CompleteResult {
   const db = getDb();
-  const now = new Date().toISOString();
-  const result = db.prepare(
-    "UPDATE ticklers SET status = 'done', completed_at = @now WHERE id = @id"
-  ).run({ id, now });
-  return result.changes > 0;
+
+  const run = db.transaction((): CompleteResult => {
+    const existing = getTickler(id);
+    if (!existing) return { completed: false };
+
+    const now = new Date().toISOString();
+    const result = db
+      .prepare("UPDATE ticklers SET status = 'done', completed_at = @now WHERE id = @id AND status = 'pending'")
+      .run({ id, now });
+    if (result.changes === 0) return { completed: false };
+
+    if (!existing.recur) return { completed: true };
+
+    const nextDue = nextFutureOccurrence(existing.recur, existing.due, now);
+    const next: Tickler = {
+      id: crypto.randomUUID(),
+      title: existing.title,
+      body: existing.body,
+      due: nextDue,
+      tags: existing.tags,
+      creator: existing.creator,
+      status: "pending",
+      createdAt: now,
+      completedAt: null,
+      recur: existing.recur,
+    };
+    createTickler(next);
+    return { completed: true, nextId: next.id, nextDue: next.due };
+  });
+
+  return run();
 }
 
 export function deleteTickler(id: string): boolean {
@@ -456,5 +520,9 @@ export function formatTickler(t: Tickler, tz?: string): string {
   const completedStr = t.completedAt
     ? `\n  Completed: ${new Date(t.completedAt).toLocaleString("en-US", tz ? { timeZone: tz } : {})}`
     : "";
-  return `[${t.status.toUpperCase()}] ${t.title}${tagsStr}\n  ID: ${t.id}\n  Due: ${dueStr}\n  Body: ${t.body}\n  Creator: ${t.creator}${completedStr}`;
+  // The displayed time-of-day always comes from this tickler's own `due` in the recur's own
+  // tz (formatRecur's second arg) — not from the `tz` display override above, since "07:00
+  // stays 07:00" is about the rule's timezone, not the viewer's.
+  const recurStr = t.recur ? `\n  Recur: ↻ ${formatRecur(t.recur, t.due)}` : "";
+  return `[${t.status.toUpperCase()}] ${t.title}${tagsStr}\n  ID: ${t.id}\n  Due: ${dueStr}\n  Body: ${t.body}\n  Creator: ${t.creator}${completedStr}${recurStr}`;
 }

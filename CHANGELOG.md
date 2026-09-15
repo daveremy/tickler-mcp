@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Recurring ticklers** ([#9](https://github.com/daveremy/tickler-mcp/issues/9)). `tickler_create`
+  and `tickler create --recur` accept an optional typed `recur` rule
+  (`{freq: "daily"|"weekly"|"monthly", interval?, byWeekday?, byMonthDay?, tz}`) instead of an
+  RRULE string — nothing here needs the RFC 5545 surface, and a typed shape is what an MCP client
+  can validate. `due` is still the first occurrence, snapped forward to the next matching date if
+  it doesn't already match the rule. Completing a recurring occurrence (`tickler_complete` /
+  `tickler complete`) atomically marks it done and creates exactly one next pending occurrence, in
+  `recur.tz`, skipping past any missed slots so the new due is never in the past. Deleting the
+  pending occurrence ends the series (no separate `stop_series` flag — one pending row per series
+  by construction). `tickler_list` / `formatTickler` / the CLI show the rule inline, e.g.
+  `↻ weekly SU 07:00 America/Phoenix`. New `recur TEXT` column, nullable, added via an idempotent
+  migration guard (`pragma table_info` + `ALTER TABLE ... ADD COLUMN`) — existing rows read back
+  with `recur: null`, byte-for-byte unchanged behavior when `recur` is omitted.
+  - Timezone-aware occurrence math (`src/recur.ts`) uses only `Intl.DateTimeFormat` — no new
+    runtime dependency. Weekly `interval > 1` is documented as best-effort / globally
+    epoch-anchored rather than RFC 5545-complete series-anchored (the issue's tested scope is
+    `interval` defaulting to 1). A genuinely nonexistent (spring-forward gap) or ambiguous
+    (fall-back overlap) wall time has no designed resolution policy — this tickler's recurring
+    due times are ordinary times of day, never inside a transition's ~1:00-3:00am window.
+
 ### Fixed
 - **Ticklers fired up to a full UTC offset early** ([#3](https://github.com/daveremy/tickler-mcp/issues/3)).
   `due` was stored exactly as supplied in a TEXT column, while `checkTicklers` compares it
