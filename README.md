@@ -40,8 +40,8 @@ npm install -g tickler-mcp
 
 | Tool | Description |
 |---|---|
-| `tickler_create` | Create a new tickler. Accepts an optional `recur` rule — see below |
-| `tickler_check` | Return past-due pending ticklers (use in cron/morning review) |
+| `tickler_create` | Create a new tickler. Accepts optional `recur` and `nag` rules — see below |
+| `tickler_check` | Return past-due pending ticklers (use in cron/morning review). Accepts an optional `mark_fired` flag — see Nag ticklers below |
 | `tickler_list` | List all ticklers, optionally filtered by status or tag |
 | `tickler_complete` | Mark a tickler done. If it was recurring, also creates the next occurrence |
 | `tickler_delete` | Permanently remove a tickler |
@@ -82,6 +82,48 @@ straight to the next future slot). Only one pending occurrence exists per series
 deleting it ends the series (there's no separate "stop recurring" flag). `tickler_list` and the
 CLI show the rule inline: `↻ weekly SU 07:00 America/Phoenix`.
 
+### Nag ticklers
+
+`tickler_create` also takes an optional `nag` object — a re-fire rule for a tickler you want
+`tickler_check` to keep surfacing, not just fire once:
+
+```json
+{
+  "every": "1d",
+  "max": 5
+}
+```
+
+- `every` (required): a duration string — `"30m"`, `"4h"`, `"1d"`, `"1w"`.
+- `max` (optional): total fires before exhaustion. Omitted means unlimited.
+
+Once a nag tickler is due, `tickler_check` returns it, then keeps returning it again every
+`every` on later calls — until `tickler_complete` is called, or `max` fires have been used. On
+the fire that reaches `max`, the tickler is flagged `nag-exhausted` in its display and
+`tickler_check` stops returning it, but it stays `pending` (visible in `tickler_list`) until
+completed or deleted.
+
+`tickler_check` takes an optional `mark_fired` parameter (default `true`). Pass `mark_fired:
+false` for a dry read that returns due ticklers without advancing any nag's fire count or
+`lastFiredAt` — useful for a preview that shouldn't consume a nag cycle. `tickler_list` is
+always a dry read; it never advances nag state.
+
+Snoozing a nag tickler pauses its cadence — `due` moves to the future exactly as for any
+tickler — and resumes it at the new `due`, treating that as a fresh first fire rather than
+waiting out the original interval from before the snooze. The exhaustion budget (`nagFireCount`
+vs `max`) is not reset by a snooze.
+
+Completing a recurring **and** nagging tickler's occurrence carries the `nag` rule to the
+successor, but the successor starts its own fresh nag cycle (`lastFiredAt: null`, fire count
+reset to 0) — it does not inherit the completed occurrence's fire history.
+
+⚠️ **Sub-1-day cadences are capped by your polling frequency.** `every` shorter than a day (e.g.
+`"4h"`) only actually re-fires as often as whatever calls `tickler_check` — typically once per
+day via a morning review route. A due-time poller that fires exactly on schedule
+([tickler-mcp#11](https://github.com/daveremy/tickler-mcp/issues/11)) is not implemented yet;
+until then, a sub-daily `every` degrades to "fires once per polling cycle," not its literal
+interval.
+
 ## CLI
 
 After installing globally or via npx:
@@ -102,6 +144,12 @@ tickler create "Weekly review" --due "2026-03-30T08:00:00-07:00" --tags "recurri
 # Create, recurring: weekly on Sunday, monthly on the 15th, or daily.
 # --recur takes "daily", "weekly:SU" (comma-separate for multiple days), or "monthly:15" — --tz is required.
 tickler create "Pickleball registration" --due "2026-09-20T07:00:00" --recur "weekly:SU" --tz "America/Phoenix" --tags pickleball
+
+# Create, nagging: re-fire every 1d until completed or 5 fires are used
+tickler create "Renew passport" --due "2026-10-01T09:00:00-07:00" --nag "1d" --nag-max 5
+
+# Check without advancing nag state (dry read)
+tickler check --no-mark-fired
 
 # Complete — if the tickler is recurring, this also creates the next occurrence
 tickler complete <id>
