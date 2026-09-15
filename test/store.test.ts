@@ -36,6 +36,7 @@ import {
   normalizeStoredDueDates,
   TICKLERS_SCHEMA_SQL,
   ensureRecurColumn,
+  formatTickler,
 } from "../src/store.js";
 import { resolveRecurForCreate, getWallTime } from "../src/recur.js";
 import type { Tickler } from "../src/types.js";
@@ -271,6 +272,26 @@ describe("store: snooze", () => {
   test("snoozeTickler returns false for unknown id", () => {
     const result = snoozeTickler("nonexistent-id", new Date().toISOString());
     assert.equal(result, false);
+  });
+
+  test("formatTickler's displayed recur rule survives a snooze unchanged (codex round-3)", () => {
+    const created = resolveRecurForCreate(
+      { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" },
+      "2026-09-13T14:00:00.000Z" // Sunday, 07:00 Phoenix
+    );
+    const t = makeTickler({ title: "format-after-snooze", recur: created.recur, due: created.due });
+    createTickler(t);
+    assert.match(formatTickler(t), /↻ weekly SU 07:00 America\/Phoenix/);
+
+    const snoozedDue = new Date(new Date(created.due).getTime() + 3600000).toISOString(); // +1h -> 08:00
+    snoozeTickler(t.id, snoozedDue);
+    const snoozed = getTickler(t.id);
+    assert.ok(snoozed);
+    assert.match(
+      formatTickler(snoozed),
+      /↻ weekly SU 07:00 America\/Phoenix/,
+      "the displayed rule must still read 07:00 (the series' canonical time), not the snoozed 08:00"
+    );
   });
 });
 

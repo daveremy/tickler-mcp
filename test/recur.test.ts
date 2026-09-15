@@ -95,6 +95,48 @@ describe("recur: DST boundary (America/New_York)", () => {
   });
 });
 
+describe("recur: snooze-independent scheduling (codex round-3)", () => {
+  test("daily interval:2 — a date-changing snoozed due does not shift the CALENDAR schedule", () => {
+    // Anchor: Sep 14 07:00 Phoenix. Un-snoozed, occurrences land Sep14, 16, 18, ...
+    // Snoozing the pending occurrence forward one day (to Sep 15) must not make the successor
+    // land on Sep 17 — it must still be Sep 16, the anchor's own schedule.
+    const recur: Recur = { freq: "daily", interval: 2, tz: "America/Phoenix", anchor: "2026-09-14T14:00:00.000Z" };
+    const snoozedDue = "2026-09-15T14:00:00.000Z"; // 07:00 Phoenix, one day later than the anchor
+    const next = nextOccurrence(recur, snoozedDue);
+    const wall = getWallTime(next, "America/Phoenix");
+    assert.equal(wall.month, 9);
+    assert.equal(wall.day, 16, "must land on the anchor's own Sep 16 slot, not Sep 17");
+    assert.equal(wall.hour, 7, "must keep the anchor's 07:00, not whatever time the snooze landed on");
+  });
+
+  test("monthly day-31 — a date-changing snoozed due does not skip a clamped short month", () => {
+    // Anchor: Jan 31 07:00 Phoenix. Un-snoozed, next occurrence is Feb 28 (clamped), not Mar 31.
+    // Snoozing the pending occurrence forward one day (to Feb 1) must not make the successor
+    // skip straight to Mar 31 — it must still be Feb 28.
+    const recur: Recur = { freq: "monthly", byMonthDay: 31, tz: "America/Phoenix", anchor: "2026-01-31T14:00:00.000Z" };
+    const snoozedDue = "2026-02-01T14:00:00.000Z"; // 07:00 Phoenix, one day later than the anchor
+    const next = nextOccurrence(recur, snoozedDue);
+    const wall = getWallTime(next, "America/Phoenix");
+    assert.equal(wall.month, 2, "must land in February, not skip to March");
+    assert.equal(wall.day, 28, "must clamp to Feb 28, matching the un-snoozed schedule");
+  });
+
+  test("weekly with byWeekday omitted — a snoozed due does not redefine the implicit weekday", () => {
+    // Anchor: Sunday 07:00 Phoenix, no byWeekday given (implicit weekday = the anchor's own).
+    // Snoozing the pending occurrence to a Tuesday must not make the series a Tuesday series.
+    const recur: Recur = { freq: "weekly", tz: "America/Phoenix", anchor: "2026-09-13T14:00:00.000Z" }; // Sunday
+    const snoozedDue = "2026-09-15T14:00:00.000Z"; // Tuesday, same week
+    const next = nextOccurrence(recur, snoozedDue);
+    const wall = getWallTime(next, "America/Phoenix");
+    assert.equal(wall.day, 20, "must land on the following Sunday (Sep 20), not a Tuesday");
+    assert.equal(
+      new Date(Date.UTC(wall.year, wall.month - 1, wall.day)).getUTCDay(),
+      0,
+      "must stay a Sunday series, not adopt the snoozed Tuesday"
+    );
+  });
+});
+
 describe("recur: monthly", () => {
   test("byMonthDay 31 clamps in short months without losing the nominal day", () => {
     const recur: Recur = { freq: "monthly", byMonthDay: 31, tz: "America/Phoenix" };

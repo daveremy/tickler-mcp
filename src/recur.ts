@@ -261,23 +261,38 @@ export function resolveRecurForCreate(
 export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
   const wall = getWallTime(afterUtcIso, recur.tz);
   const interval = recur.interval ?? 1;
-  // The canonical reference for BOTH weekly interval-week alignment and the series'
-  // time-of-day is `recur.anchor` (the series' fixed first occurrence) when present, never
-  // `wall` — `wall` comes from `afterUtcIso`, which for a completed occurrence may be a
-  // snoozed `due` with a different date and/or time-of-day than the series was ever meant to
-  // run on. Falls back to `wall` itself when no anchor is set (a recur that predates the
-  // anchor field, or a direct caller that skipped `resolveRecurForCreate`) — this reproduces
-  // the exact pre-anchor behavior, so it is not a regression for that case.
+  const afterMs = new Date(afterUtcIso).getTime();
+  // Every candidate's calendar schedule AND time-of-day are always measured from the series'
+  // fixed `recur.anchor` (its own first occurrence) when present, NEVER from `wall` — `wall`
+  // comes from `afterUtcIso`, which for a completed occurrence may be a snoozed `due` on a
+  // different date and/or time than the series was ever meant to run on. A snooze must move
+  // only the snoozed occurrence itself; every later occurrence stays exactly where the anchor
+  // says it belongs, regardless of freq (codex round-2/round-3 code review). Falls back to
+  // `wall` itself when no anchor is set (a recur that predates the anchor field, or a direct
+  // caller that skipped `resolveRecurForCreate`) — reproduces the exact pre-anchor behavior
+  // for that case, so it is not a regression there.
   const anchorWall = recur.anchor !== undefined ? getWallTime(recur.anchor, recur.tz) : wall;
+  const anchorMs = new Date(recur.anchor ?? afterUtcIso).getTime();
   const timeOfDay = { hour: anchorWall.hour, minute: anchorWall.minute, second: anchorWall.second };
 
   if (recur.freq === "daily") {
-    const candidate = { ...addCalDays(wall, interval), ...timeOfDay };
-    return wallTimeToUtcIso(candidate, recur.tz);
+    const periodMs = interval * 86400000;
+    // Closed-form estimate of the smallest period count k with (anchor + k periods) >
+    // afterMs, corrected by a small bounded walk — cheap even when the anchor is years old,
+    // unlike rescanning day-by-day from the anchor every call.
+    const candidateAt = (k: number) => wallTimeToUtcIso({ ...addCalDays(anchorWall, k * interval), ...timeOfDay }, recur.tz);
+    let k = Math.max(0, Math.floor((afterMs - anchorMs) / periodMs));
+    while (k > 0 && new Date(candidateAt(k - 1)).getTime() > afterMs) k -= 1;
+    while (new Date(candidateAt(k)).getTime() <= afterMs) k += 1;
+    return candidateAt(k);
   }
 
   if (recur.freq === "weekly") {
-    const days = (recur.byWeekday?.length ? recur.byWeekday.map((w) => WEEKDAY_INDEX[w]) : [calWeekday(wall)])
+    // The implicit single-weekday default is derived from the ANCHOR's weekday, never from
+    // `wall`'s — otherwise snoozing an occurrence to a different day of the week would
+    // silently redefine which weekday an omitted `byWeekday` means going forward (codex
+    // round-3 code review).
+    const days = (recur.byWeekday?.length ? recur.byWeekday.map((w) => WEEKDAY_INDEX[w]) : [calWeekday(anchorWall)])
       .slice()
       .sort((a, b) => a - b);
     // Interval-week alignment is measured from the FIXED anchor (or `wall` as a fallback, see
@@ -286,13 +301,16 @@ export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
     // active week's Wednesday first (correct), but a per-call anchor then treats THAT
     // Wednesday as week 0 for its own call and matches the following Monday too, running
     // every week instead of the intended interval (codex round-2 code review).
-    const anchorMs = calDateToUtcMs(anchorWall.year, anchorWall.month, anchorWall.day);
+    const anchorWeekMs = calDateToUtcMs(anchorWall.year, anchorWall.month, anchorWall.day);
+    // The scan itself still starts from `wall` and walks forward day-by-day — that's fine and
+    // stays cheap (bounded at `interval*7+7` regardless of how old the anchor is) because
+    // phase is a modulo of a FIXED period, not a distance from the anchor.
     let candidate = wall;
     const bound = interval * 7 + 7;
     for (let i = 0; i < bound; i++) {
       candidate = addCalDays(candidate, 1);
       const candidateMs = calDateToUtcMs(candidate.year, candidate.month, candidate.day);
-      const weeksSinceAnchor = Math.floor((candidateMs - anchorMs) / (7 * 86400000));
+      const weeksSinceAnchor = Math.floor((candidateMs - anchorWeekMs) / (7 * 86400000));
       // Modulo of a value that can be negative (a candidate before the anchor's own week, e.g.
       // when `wall` predates `anchor`) must not be compared to 0 with JS's sign-preserving `%`.
       const phase = ((weeksSinceAnchor % interval) + interval) % interval;
@@ -304,13 +322,21 @@ export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
   }
 
   // monthly
-  const targetDay = recur.byMonthDay ?? wall.day;
-  const targetMonthIndex = (wall.year * 12 + (wall.month - 1)) + interval;
-  const targetYear = Math.floor(targetMonthIndex / 12);
-  const targetMonth = (targetMonthIndex % 12) + 1;
-  const day = Math.min(targetDay, daysInMonth(targetYear, targetMonth));
-  const candidate: WallTime = { ...wall, year: targetYear, month: targetMonth, day, ...timeOfDay };
-  return wallTimeToUtcIso(candidate, recur.tz);
+  const targetDay = recur.byMonthDay ?? anchorWall.day;
+  const anchorMonthIndex = anchorWall.year * 12 + (anchorWall.month - 1);
+  const candidateAt = (k: number): string => {
+    const idx = anchorMonthIndex + k * interval;
+    const year = Math.floor(idx / 12);
+    const month = (idx % 12) + 1;
+    const day = Math.min(targetDay, daysInMonth(year, month));
+    return wallTimeToUtcIso({ ...anchorWall, year, month, day, ...timeOfDay }, recur.tz);
+  };
+  // Same closed-form-plus-correction approach as daily, in month units instead of days.
+  const approxMonthsPerPeriod = interval * 30.44 * 86400000; // rough; corrected below
+  let k = Math.max(0, Math.floor((afterMs - anchorMs) / approxMonthsPerPeriod));
+  while (k > 0 && new Date(candidateAt(k - 1)).getTime() > afterMs) k -= 1;
+  while (new Date(candidateAt(k)).getTime() <= afterMs) k += 1;
+  return candidateAt(k);
 }
 
 /**

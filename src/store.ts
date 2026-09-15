@@ -520,9 +520,12 @@ export function formatTickler(t: Tickler, tz?: string): string {
   const completedStr = t.completedAt
     ? `\n  Completed: ${new Date(t.completedAt).toLocaleString("en-US", tz ? { timeZone: tz } : {})}`
     : "";
-  // The displayed time-of-day always comes from this tickler's own `due` in the recur's own
-  // tz (formatRecur's second arg) — not from the `tz` display override above, since "07:00
-  // stays 07:00" is about the rule's timezone, not the viewer's.
-  const recurStr = t.recur ? `\n  Recur: ↻ ${formatRecur(t.recur, t.due)}` : "";
+  // The displayed rule always comes from the series' own fixed anchor, never from this
+  // occurrence's (possibly snoozed) `due` — otherwise snoozing Sunday 07:00 to 08:00 would
+  // display "↻ weekly SU 08:00 ..." even though every later occurrence still fires at 07:00
+  // (codex round-3 code review). Falls back to `t.due` for a recur that predates the anchor
+  // field. Also not the `tz` display override above — "07:00 stays 07:00" is about the rule's
+  // own timezone, not the viewer's.
+  const recurStr = t.recur ? `\n  Recur: ↻ ${formatRecur(t.recur, t.recur.anchor ?? t.due)}` : "";
   return `[${t.status.toUpperCase()}] ${t.title}${tagsStr}\n  ID: ${t.id}\n  Due: ${dueStr}\n  Body: ${t.body}\n  Creator: ${t.creator}${completedStr}${recurStr}`;
 }

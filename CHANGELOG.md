@@ -23,11 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   with `recur: null`, byte-for-byte unchanged behavior when `recur` is omitted.
   - Timezone-aware occurrence math (`src/recur.ts`) uses only `Intl.DateTimeFormat` — no new
     runtime dependency. Each recurring series carries a fixed `recur.anchor` (its own first
-    occurrence, set once and never modified afterward), which weekly `interval > 1` alignment
-    and the series' canonical time-of-day are always measured against — so a biweekly rule stays
-    biweekly regardless of which week the series started in or how many weekdays it names, and
-    snoozing one occurrence to a different date/time can never shift the schedule of the
-    occurrences that follow it. A monthly rule's day-of-month is persisted explicitly at
+    occurrence, set once and never modified afterward), which every frequency's calendar
+    schedule and canonical time-of-day are always measured against — so a biweekly weekly rule
+    stays biweekly regardless of which week the series started in or how many weekdays it
+    names, and snoozing one occurrence (to a different date, a different time, or both) can
+    never shift the date, time, or displayed rule of the occurrences that follow it. A monthly
+    rule's day-of-month is persisted explicitly at
     creation (from the first occurrence when the caller omits `byMonthDay`), so it can never
     drift after a clamped short month (e.g. day-31 surviving a February landing at day 28). A
     genuinely nonexistent (spring-forward gap) or ambiguous (fall-back overlap) wall time has no
