@@ -28,6 +28,10 @@ jobs:
       # Trusted Publishing needs npm >= 11.5; node 22 ships an older npm.
       - run: npm install -g npm@latest
       - run: npm ci
+      # npm >= 11.x no longer runs dependency install scripts (install-time security,
+      # July 2026), so better-sqlite3's native bindings never build — measured on the first
+      # v1.2.0 run: every DB test failed with "Could not locate the bindings file".
+      - run: npm rebuild better-sqlite3
       - run: npm run build
       - run: npm test
       - name: Tag must match package.json
