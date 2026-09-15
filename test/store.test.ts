@@ -54,6 +54,9 @@ function makeTickler(overrides: Partial<Tickler> = {}): Tickler {
     createdAt: new Date().toISOString(),
     completedAt: null,
     recur: null,
+    nag: null,
+    lastFiredAt: null,
+    nagFireCount: 0,
     ...overrides,
   };
 }

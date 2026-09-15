@@ -3,9 +3,10 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import * as crypto from "crypto";
-import type { Tickler } from "./types.js";
+import type { Tickler, Nag } from "./types.js";
 import type { Recur } from "./recur.js";
 import { formatRecur, nextFutureOccurrence } from "./recur.js";
+import { parseDuration } from "./duration.js";
 
 // Resolved lazily at each call so tests can set TICKLER_DB_PATH before importing.
 export function getDbPath(): string {
@@ -129,7 +130,11 @@ export const TICKLERS_SCHEMA_SQL = `
     created_at TEXT NOT NULL,
     completed_at TEXT,
     snoozed_until TEXT,
-    recur TEXT
+    recur TEXT,
+    nag_every TEXT,
+    nag_max INTEGER,
+    last_fired_at TEXT,
+    nag_fire_count INTEGER NOT NULL DEFAULT 0
   )
 `;
 
@@ -138,8 +143,8 @@ export const TICKLERS_SCHEMA_SQL = `
  * untouched. `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists
  * without a newly-added column, so any column added after the schema first shipped needs
  * one of these. Extracted as a reusable helper (rather than one hardcoded per column) so a
- * sibling migration — #11 (nag) shares this exact need for its own new column — can call it
- * directly instead of duplicating the PRAGMA/ALTER pair (issue #9 comment: "keep the
+ * sibling migration — issue #10 (nag) shares this exact need for its own new columns — can
+ * call it directly instead of duplicating the PRAGMA/ALTER pair (issue #9 comment: "keep the
  * ADD-COLUMN guard generic so both branches merge cleanly").
  */
 export function ensureColumn(db: Database.Database, columnName: string, sqlType: string): void {
@@ -155,12 +160,27 @@ export function ensureRecurColumn(db: Database.Database): void {
   ensureColumn(db, "recur", "TEXT");
 }
 
+/**
+ * `nag`'s own instance of the generic guard above (issue #10). Stored as flat columns
+ * rather than one JSON blob (unlike `recur`, which is genuinely nested) so `checkTicklers`
+ * can filter out already-exhausted nag ticklers directly in SQL (`nag_max IS NULL OR
+ * nag_fire_count < nag_max`) instead of materializing and discarding them in JS as
+ * reminder history grows.
+ */
+export function ensureNagColumns(db: Database.Database): void {
+  ensureColumn(db, "nag_every", "TEXT");
+  ensureColumn(db, "nag_max", "INTEGER");
+  ensureColumn(db, "last_fired_at", "TEXT");
+  ensureColumn(db, "nag_fire_count", "INTEGER NOT NULL DEFAULT 0");
+}
+
 function openDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
 
   db.exec(TICKLERS_SCHEMA_SQL);
   ensureRecurColumn(db);
+  ensureNagColumns(db);
 
   normalizeStoredDueDates(db);
 
@@ -294,17 +314,19 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
     typeof dbOrPath === "string" ? openDb(dbOrPath) : dbOrPath;
   // `openDb` already runs the schema/column guards for the string-path branch above. The
   // already-open-handle branch must run them too, defensively — a caller (this repo's own
-  // sibling #11 migration, or any future one) may hand `runMigration` a `Database.Database`
-  // that was never opened through `openDb`, and the INSERT below fails on a genuinely old
-  // schema without this (codex round-4 code review, issue #9). Both guards are idempotent.
+  // sibling issue #10 migration, or any future one) may hand `runMigration` a
+  // `Database.Database` that was never opened through `openDb`, and the INSERT below fails on
+  // a genuinely old schema without this (codex round-4 code review, issue #9). All guards are
+  // idempotent.
   db.exec(TICKLERS_SCHEMA_SQL);
   ensureRecurColumn(db);
+  ensureNagColumns(db);
 
   const ticklers = Array.isArray(parsed.ticklers) ? parsed.ticklers : [];
 
   const insert = db.prepare(`
-    INSERT OR IGNORE INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur)
-    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur)
+    INSERT OR IGNORE INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur, nag_every, nag_max, last_fired_at, nag_fire_count)
+    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur, @nag_every, @nag_max, @last_fired_at, @nag_fire_count)
   `);
 
   const migrate = db.transaction((rows: Tickler[]) => {
@@ -337,6 +359,13 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
         completed_at: t.completedAt ?? null,
         snoozed_until: null,
         recur: t.recur ? JSON.stringify(t.recur) : null,
+        // Legacy JSON predates nag (issue #10) — a row from that era never has it,
+        // but a future-format import might, so read it defensively rather than
+        // assuming null.
+        nag_every: t.nag?.every ?? null,
+        nag_max: t.nag?.max ?? null,
+        last_fired_at: t.lastFiredAt ?? null,
+        nag_fire_count: t.nagFireCount ?? 0,
       });
     }
     return skipped;
@@ -382,14 +411,19 @@ function rowToTickler(row: Record<string, unknown>): Tickler {
     createdAt: row.created_at as string,
     completedAt: (row.completed_at as string | null) ?? null,
     recur: row.recur ? (JSON.parse(row.recur as string) as Recur) : null,
+    nag: row.nag_every
+      ? { every: row.nag_every as string, max: (row.nag_max as number | null) ?? undefined }
+      : null,
+    lastFiredAt: (row.last_fired_at as string | null) ?? null,
+    nagFireCount: (row.nag_fire_count as number | null) ?? 0,
   };
 }
 
 export function createTickler(tickler: Tickler): void {
   const db = getDb();
   db.prepare(`
-    INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur)
-    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur)
+    INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur, nag_every, nag_max, last_fired_at, nag_fire_count)
+    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur, @nag_every, @nag_max, @last_fired_at, @nag_fire_count)
   `).run({
     id: tickler.id,
     title: tickler.title,
@@ -402,6 +436,10 @@ export function createTickler(tickler: Tickler): void {
     completed_at: tickler.completedAt ?? null,
     snoozed_until: null,
     recur: tickler.recur ? JSON.stringify(tickler.recur) : null,
+    nag_every: tickler.nag?.every ?? null,
+    nag_max: tickler.nag?.max ?? null,
+    last_fired_at: tickler.lastFiredAt ?? null,
+    nag_fire_count: tickler.nagFireCount ?? 0,
   });
 }
 
@@ -432,13 +470,98 @@ export function listTicklers(opts?: { status?: "pending" | "done"; tag?: string 
   return ticklers;
 }
 
-export function checkTicklers(): Tickler[] {
+/**
+ * Attempt to atomically claim a nag fire for `candidate`, using its own previously-read
+ * `lastFiredAt` as the CAS comparison (same shape as `completeTickler`'s `AND status =
+ * 'pending'` and `normalizeStoredDueDates`'s `AND due = @old`). Exported so tests can drive
+ * it directly against a deliberately STALE snapshot — `checkTicklers`'s own base query
+ * already excludes a row that changed before it ran, so a race that happens strictly
+ * *between* reading a candidate and claiming it can only be exercised by calling this
+ * helper with a snapshot read before some other mutation landed (issue #10, codex plan
+ * review rounds 2-3).
+ *
+ * Returns the updated `Tickler` (with `lastFiredAt`/`nagFireCount` reflecting the claim) on
+ * success, or `null` if the live row no longer matches `candidate`'s assumptions — already
+ * completed, no longer due (e.g. snoozed into the future since `candidate` was read),
+ * already exhausted, or already fired by a concurrent claim.
+ */
+export function claimNagFire(candidate: Tickler, now: string): Tickler | null {
+  const db = getDb();
+  const result = db
+    .prepare(
+      `UPDATE ticklers
+       SET last_fired_at = @now, nag_fire_count = nag_fire_count + 1
+       WHERE id = @id
+         AND status = 'pending'
+         AND due <= @now
+         AND (nag_max IS NULL OR nag_fire_count < nag_max)
+         AND ((last_fired_at IS NULL AND @oldLastFiredAt IS NULL) OR last_fired_at = @oldLastFiredAt)`
+    )
+    .run({ id: candidate.id, now, oldLastFiredAt: candidate.lastFiredAt });
+  if (result.changes === 0) return null;
+  return { ...candidate, lastFiredAt: now, nagFireCount: candidate.nagFireCount + 1 };
+}
+
+/**
+ * Nag-eligibility check for a candidate already known to be pending and due (issue #10).
+ * Non-nag ticklers are always eligible (unchanged behavior). A nag ticklers is eligible if
+ * it has never fired, or `every` has elapsed since its last fire — already-exhausted rows
+ * are filtered out in SQL before this runs (see `checkTicklers`), so this never needs to
+ * check `max` itself.
+ */
+function isNagEligible(t: Tickler, now: string): boolean {
+  if (!t.nag) return true;
+  if (t.lastFiredAt === null) return true;
+  const everyMs = parseDuration(t.nag.every);
+  // Validated at create time; a null here would mean corrupt data — treat as
+  // always-eligible rather than throwing mid-scan.
+  if (everyMs === null) return true;
+  const elapsed = Date.parse(now) - Date.parse(t.lastFiredAt);
+  return elapsed >= everyMs;
+}
+
+/**
+ * Return past-due pending ticklers. By default (`markFired: true`) a due nag tickler's fire
+ * is claimed atomically — `lastFiredAt`/`nagFireCount` advance and it will not be returned
+ * again until `every` elapses (or ever again, once `max` fires are reached — issue #10).
+ * Pass `markFired: false` for a dry read (what `tickler_list` structurally already gets, and
+ * what `tickler_check --no-mark-fired` / `mark_fired:false` opts into explicitly) that never
+ * advances the nag clock.
+ */
+export function checkTicklers(markFired: boolean = true): Tickler[] {
   const db = getDb();
   const now = new Date().toISOString();
-  const rows = db.prepare(
-    "SELECT * FROM ticklers WHERE status = 'pending' AND due <= @now ORDER BY due ASC"
-  ).all({ now }) as Record<string, unknown>[];
-  return rows.map(rowToTickler);
+  // Already-exhausted nag rows are excluded here in SQL, not materialized and discarded in
+  // JS, so a long tail of acknowledged-but-never-completed nag ticklers doesn't grow this
+  // scan (codex plan-review round 1 COST finding).
+  const rows = db
+    .prepare(
+      `SELECT * FROM ticklers
+       WHERE status = 'pending' AND due <= @now
+         AND (nag_every IS NULL OR nag_max IS NULL OR nag_fire_count < nag_max)
+       ORDER BY due ASC`
+    )
+    .all({ now }) as Record<string, unknown>[];
+  const candidates = rows.map(rowToTickler);
+
+  const due: Tickler[] = [];
+  for (const t of candidates) {
+    if (!isNagEligible(t, now)) continue;
+    if (!t.nag) {
+      due.push(t);
+      continue;
+    }
+    if (!markFired) {
+      due.push(t);
+      continue;
+    }
+    const claimed = claimNagFire(t, now);
+    // claimNagFire returning null here means the row changed since this SELECT read it
+    // (another process claimed it, snoozed it, or it became exhausted) — skip it this cycle
+    // rather than returning stale data.
+    if (claimed) due.push(claimed);
+  }
+  return due;
 }
 
 export interface CompleteResult {
@@ -485,6 +608,11 @@ export function completeTickler(id: string): CompleteResult {
       createdAt: now,
       completedAt: null,
       recur: existing.recur,
+      // The nag RULE persists to the successor, but it starts its own fresh cycle —
+      // never inherits the prior occurrence's fire history (issue #10).
+      nag: existing.nag,
+      lastFiredAt: null,
+      nagFireCount: 0,
     };
     createTickler(next);
     return { completed: true, nextId: next.id, nextDue: next.due };
@@ -505,9 +633,15 @@ export function snoozeTickler(id: string, newDue: string): boolean {
   // as a create does, and fixing only create leaves the same bug reachable by a
   // different door while looking identical from the outside.
   const due = normalizeDue(newDue);
-  // Re-open a completed tickler if it is being snoozed
+  // Re-open a completed tickler if it is being snoozed. `last_fired_at` is reset to NULL
+  // unconditionally (harmless for non-nag rows, where it's already unused) so a nag
+  // tickler's cadence "pauses" while `due` is in the future — the base due<=now filter in
+  // `checkTicklers` already excludes it — and "resumes" exactly at the new `due`: with
+  // `lastFiredAt` null, the next check treats it as a fresh first fire rather than waiting
+  // out the interval from before the snooze (issue #10, codex plan-review round 1).
+  // `nag_fire_count` is left untouched — snoozing must not reset the `max` exhaustion budget.
   const result = db.prepare(
-    "UPDATE ticklers SET due = @due, status = 'pending', completed_at = NULL WHERE id = @id"
+    "UPDATE ticklers SET due = @due, status = 'pending', completed_at = NULL, last_fired_at = NULL WHERE id = @id"
   ).run({ id, due });
   return result.changes > 0;
 }
@@ -542,5 +676,22 @@ export function formatTickler(t: Tickler, tz?: string): string {
   // round-3 code review). Also not the `tz` display override above — "07:00 stays 07:00" is
   // about the rule's own timezone, not the viewer's.
   const recurStr = t.recur ? `\n  Recur: ↻ ${formatRecur(t.recur)}` : "";
-  return `[${t.status.toUpperCase()}] ${t.title}${tagsStr}\n  ID: ${t.id}\n  Due: ${dueStr}\n  Body: ${t.body}\n  Creator: ${t.creator}${completedStr}${recurStr}`;
+  const nagStr = t.nag ? `\n  Nag: ${formatNag(t.nag, t.lastFiredAt, t.nagFireCount, tz)}` : "";
+  return `[${t.status.toUpperCase()}] ${t.title}${tagsStr}\n  ID: ${t.id}\n  Due: ${dueStr}\n  Body: ${t.body}\n  Creator: ${t.creator}${completedStr}${recurStr}${nagStr}`;
+}
+
+/**
+ * Render a nag rule's live state, e.g. `⟳ every 1d (fired 3×, last Sep 15, 2026, 2:00 PM)`,
+ * appending `, nag-exhausted` once `max` fires have been used (issue #10). Exhaustion is
+ * derived here from `nagFireCount` vs `nag.max` rather than a stored boolean, so there is no
+ * second source of truth that could drift from the count.
+ */
+function formatNag(nag: Nag, lastFiredAt: string | null, nagFireCount: number, tz?: string): string {
+  const maxStr = nag.max !== undefined ? ` (max ${nag.max})` : "";
+  const lastStr = lastFiredAt
+    ? `, last ${new Date(lastFiredAt).toLocaleString("en-US", tz ? { timeZone: tz } : {})}`
+    : "";
+  const exhausted = nag.max !== undefined && nagFireCount >= nag.max;
+  const exhaustedStr = exhausted ? ", nag-exhausted" : "";
+  return `⟳ every ${nag.every}${maxStr} (fired ${nagFireCount}×${lastStr}${exhaustedStr})`;
 }

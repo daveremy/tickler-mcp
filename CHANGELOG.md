@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Nag ticklers** ([#10](https://github.com/daveremy/tickler-mcp/issues/10)). `tickler_create` /
+  `tickler create --nag <duration> [--nag-max <n>]` accept an optional `nag` rule
+  (`{every: string, max?: number}`). Once due, `tickler_check` keeps returning the tickler every
+  `every` — not just once — until `tickler_complete` or `max` fires are used; the fire that
+  reaches `max` is flagged `nag-exhausted` in its display and stops being returned, while the
+  tickler stays `pending` (still visible via `tickler_list`) until completed or deleted. New
+  `tickler_check` param / CLI flag `mark_fired` / `--no-mark-fired` (default `true`) opts into a
+  dry read that leaves nag state untouched — `tickler_list` is always a dry read. Snoozing a nag
+  tickler pauses its cadence and resumes it at the new due (treated as a fresh first fire) without
+  resetting the `max` exhaustion budget. A recurring-and-nagging series' successor inherits the
+  `nag` rule but starts its own fresh fire history. Sub-1-day `every` values only re-fire as often
+  as the caller actually polls `tickler_check` until a due-time poller
+  ([#11](https://github.com/daveremy/tickler-mcp/issues/11)) exists — documented in the tool
+  description and README rather than solved here.
+  - Stored as flat `nag_every`/`nag_max`/`last_fired_at`/`nag_fire_count` columns (not a JSON
+    blob, unlike `recur`) so `checkTicklers` can exclude already-exhausted rows directly in SQL.
+    Added via the same idempotent `ensureColumn` migration guard `recur` uses.
+  - A nag fire is claimed with a compare-and-swap `UPDATE` (`claimNagFire`, exported for direct
+    testing) guarded on `status`, `due`, `nag_max`, and the candidate's own previously-read
+    `last_fired_at` — closing a race where concurrent MCP processes could otherwise double-count
+    a fire past `max`, or fire a tickler a concurrent snooze had just pushed into the future.
 - **Recurring ticklers** ([#9](https://github.com/daveremy/tickler-mcp/issues/9)). `tickler_create`
   and `tickler create --recur` accept an optional typed `recur` rule
   (`{freq: "daily"|"weekly"|"monthly", interval?, byWeekday?, byMonthDay?, tz}`) instead of an

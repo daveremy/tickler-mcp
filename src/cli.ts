@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import * as crypto from "crypto";
-import type { Tickler } from "./types.js";
+import type { Tickler, Nag } from "./types.js";
 import {
   createTickler,
   listTicklers,
@@ -84,9 +84,10 @@ program
 
 program
   .command("check")
-  .description("Show past-due pending ticklers (exit 1 if any are due, 0 if none)")
-  .action(() => {
-    const overdue = checkTicklers();
+  .description("Show past-due pending ticklers (exit 1 if any are due, 0 if none). A due nag tickler is shown again once its interval elapses, until completed or exhausted.")
+  .option("--no-mark-fired", "dry read — don't advance nag state (lastFiredAt/fire count)")
+  .action((opts: { markFired: boolean }) => {
+    const overdue = checkTicklers(opts.markFired);
 
     if (overdue.length === 0) {
       console.log("No past-due ticklers.");
@@ -131,7 +132,9 @@ program
   .option("--creator <creator>", "Who is creating this", "cli")
   .option("--recur <spec>", 'Recurrence: "daily", "weekly:SU" (comma for multiple), or "monthly:15". Requires --tz.')
   .option("--tz <zone>", "IANA timezone for --recur, e.g. America/Phoenix")
-  .action((title: string, opts: { due: string; body: string; tags?: string; creator: string; recur?: string; tz?: string }) => {
+  .option("--nag <duration>", 'Re-fire every duration once due, e.g. "1d", "4h", until completed. Cadences under 1d only fire once/day until tickler-mcp#11 lands.')
+  .option("--nag-max <n>", "Total nag fires before exhaustion (requires --nag)")
+  .action((title: string, opts: { due: string; body: string; tags?: string; creator: string; recur?: string; tz?: string; nag?: string; nagMax?: string }) => {
     // Normalize up front so the value printed back is the value stored.
     let due: string;
     try {
@@ -164,6 +167,31 @@ program
       }
     }
 
+    if (opts.nagMax !== undefined && !opts.nag) {
+      console.error("Error: --nag-max requires --nag.");
+      process.exit(1);
+    }
+
+    let nag: Nag | null = null;
+    if (opts.nag) {
+      const everyMs = parseDuration(opts.nag);
+      if (everyMs === null || everyMs <= 0) {
+        console.error(`Error: Invalid --nag "${opts.nag}". Use formats like "1d", "3h", "1w", "30m".`);
+        process.exit(1);
+      }
+      let max: number | undefined;
+      if (opts.nagMax !== undefined) {
+        // Require the ENTIRE token to be plain digits before converting — same guard as
+        // --recur monthly's day parsing (parseInt alone silently truncates "5junk"/"5.5").
+        if (!/^\d+$/.test(opts.nagMax) || parseInt(opts.nagMax, 10) < 1) {
+          console.error(`Error: Invalid --nag-max "${opts.nagMax}" — expected a positive integer.`);
+          process.exit(1);
+        }
+        max = parseInt(opts.nagMax, 10);
+      }
+      nag = { every: opts.nag, max };
+    }
+
     const tickler: Tickler = {
       id: crypto.randomUUID(),
       title,
@@ -175,6 +203,9 @@ program
       createdAt: new Date().toISOString(),
       completedAt: null,
       recur,
+      nag,
+      lastFiredAt: null,
+      nagFireCount: 0,
     };
 
     createTickler(tickler);
@@ -184,6 +215,7 @@ program
     console.log(`Due:     ${tickler.due}${snappedNote}`);
     if (tags.length > 0) console.log(`Tags:    ${tags.join(", ")}`);
     if (recur) console.log(`Recur:   ${opts.recur} ${opts.tz}`);
+    if (nag) console.log(`Nag:     every ${nag.every}${nag.max !== undefined ? ` (max ${nag.max})` : ""}`);
     console.log(`Store:   ${getDbPath()}`);
   });
 

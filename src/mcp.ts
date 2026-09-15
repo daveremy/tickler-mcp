@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import * as crypto from "crypto";
-import type { Tickler } from "./types.js";
+import type { Tickler, Nag } from "./types.js";
 import {
   createTickler,
   listTicklers,
@@ -39,6 +39,19 @@ const recurSchema = z
       "occurrence creates the next one automatically."
   );
 
+const nagSchema = z
+  .object({
+    every: z.string().describe("Re-fire interval, a duration string e.g. \"1d\", \"4h\""),
+    max: z.number().int().min(1).optional().describe("Total fires before exhaustion (omit for unlimited)"),
+  })
+  .optional()
+  .describe(
+    "Optional nag rule. Once due, `tickler_check` keeps returning this tickler every `every` " +
+      "until `tickler_complete` or `max` fires are reached (flagged nag-exhausted on the final " +
+      "fire, still pending). Nag cadences shorter than 1 day only fire once per the daily " +
+      "morning tickler_check route until a due-time poller (tickler-mcp#11) lands."
+  );
+
 const server = new McpServer({ name: "tickler-mcp", version: VERSION });
 
 server.tool(
@@ -55,8 +68,9 @@ server.tool(
     tags: z.array(z.string()).optional().describe("Optional tags for filtering (e.g. [\"eng\", \"clubexpress\"])"),
     creator: z.string().optional().describe("Agent or user creating this tickler (e.g. karpathy, marcus)"),
     recur: recurSchema,
+    nag: nagSchema,
   },
-  async ({ title, body, due: dueInput, tags = [], creator = "unknown", recur }) => {
+  async ({ title, body, due: dueInput, tags = [], creator = "unknown", recur, nag }) => {
     // Normalize up front so the value echoed back is the value stored.
     let due: string;
     try {
@@ -80,6 +94,18 @@ server.tool(
       }
     }
 
+    let resolvedNag: Nag | null = null;
+    if (nag) {
+      const everyMs = parseDuration(nag.every);
+      if (everyMs === null || everyMs <= 0) {
+        return {
+          content: [{ type: "text" as const, text: `Error: Invalid nag.every "${nag.every}". Use formats like "1d", "3h", "1w", "30m".` }],
+          isError: true,
+        };
+      }
+      resolvedNag = { every: nag.every, max: nag.max };
+    }
+
     const tickler: Tickler = {
       id: crypto.randomUUID(),
       title,
@@ -91,6 +117,9 @@ server.tool(
       createdAt: new Date().toISOString(),
       completedAt: null,
       recur: resolvedRecur,
+      nag: resolvedNag,
+      lastFiredAt: null,
+      nagFireCount: 0,
     };
 
     createTickler(tickler);
@@ -125,10 +154,16 @@ server.tool(
 
 server.tool(
   "tickler_check",
-  "Return only past-due pending ticklers (due <= now). Designed for cron polling — call this at the start of each review session.",
-  {},
-  async () => {
-    const overdue = checkTicklers();
+  "Return only past-due pending ticklers (due <= now). Designed for cron polling — call this at the start of each review session. " +
+    "A due nag tickler is returned again on later calls once its `every` interval elapses, until completed or exhausted. " +
+    "Nag cadences shorter than 1 day only fire once per the daily morning route until a due-time poller (tickler-mcp#11) lands.",
+  {
+    mark_fired: z.boolean().optional().describe(
+      "Default true. Set false for a dry read that does not advance nag state (lastFiredAt/fire count) — use tickler_list for that instead when possible."
+    ),
+  },
+  async ({ mark_fired }) => {
+    const overdue = checkTicklers(mark_fired ?? true);
 
     if (overdue.length === 0) {
       return { content: [{ type: "text" as const, text: "No past-due ticklers." }] };
