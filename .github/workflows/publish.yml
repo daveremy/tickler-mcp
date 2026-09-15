@@ -28,9 +28,10 @@ jobs:
       # Trusted Publishing needs npm >= 11.5; node 22 ships an older npm.
       - run: npm install -g npm@latest
       - run: npm ci
-      # npm >= 11.x no longer runs dependency install scripts (install-time security,
-      # July 2026), so better-sqlite3's native bindings never build — measured on the first
-      # v1.2.0 run: every DB test failed with "Could not locate the bindings file".
+      # npm 12 blocks dependency install scripts unless package.json allowScripts lists
+      # them (better-sqlite3 is). `npm rebuild` then builds the native bindings; measured
+      # on the first two v1.2.0 runs: without allowScripts every DB test failed with
+      # "Could not locate the bindings file", and a bare rebuild was a silent no-op.
       - run: npm rebuild better-sqlite3
       - run: npm run build
       - run: npm test
