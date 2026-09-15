@@ -33,6 +33,7 @@ import {
   listTicklers,
   checkTicklers,
   completeTickler,
+  deleteTickler,
   snoozeTickler,
   getTickler,
   claimNagFire,
@@ -149,6 +150,47 @@ describe("nag: exhaustion (max)", () => {
 
     const stillListed = listTicklers({ status: "pending" });
     assert.ok(stillListed.some((r) => r.id === t.id), "tickler_list must still show the exhausted tickler while it stays pending");
+  });
+
+  test("max:1 exhausts immediately on the very first fire", () => {
+    const t = makeTickler({ title: "nag-exhaustion-max-one", nag: { every: "1h", max: 1 } });
+    createTickler(t);
+
+    const firstFire = checkTicklers();
+    const found = firstFire.find((r) => r.id === t.id);
+    assert.ok(found, "the single allowed fire must still be returned");
+    assert.equal(found!.nagFireCount, 1);
+
+    const db = new Database(TEST_DB);
+    db.prepare("UPDATE ticklers SET last_fired_at = @t WHERE id = @id").run({
+      id: t.id,
+      t: new Date(Date.now() - 2 * 3600000).toISOString(),
+    });
+    db.close();
+
+    const afterExhaustion = checkTicklers();
+    assert.ok(!afterExhaustion.some((r) => r.id === t.id), "max:1 must exhaust immediately after its one fire");
+  });
+});
+
+describe("nag: delete mid-cadence", () => {
+  test("deleting a nag tickler mid-cadence removes it cleanly with no error or orphaned state", () => {
+    const t = makeTickler({ title: "nag-delete-mid-cadence", nag: { every: "1h", max: 3 } });
+    createTickler(t);
+
+    checkTicklers(); // fire 1/3
+    assert.ok(getTickler(t.id));
+
+    const db = new Database(TEST_DB);
+    const before = db.prepare("SELECT COUNT(*) as cnt FROM ticklers WHERE id = @id").get({ id: t.id }) as { cnt: number };
+    assert.equal(before.cnt, 1);
+    db.close();
+
+    assert.doesNotThrow(() => deleteTickler(t.id));
+    assert.equal(getTickler(t.id), undefined, "the row must be gone");
+
+    const afterCheck = checkTicklers();
+    assert.ok(!afterCheck.some((r) => r.id === t.id), "a deleted nag tickler must never resurface via checkTicklers");
   });
 });
 
