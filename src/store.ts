@@ -134,16 +134,25 @@ export const TICKLERS_SCHEMA_SQL = `
 `;
 
 /**
- * `recur` is the first column added to an already-shipped schema, so unlike every other
- * column (present since before any real DB existed) it needs an explicit, idempotent
- * migration guard rather than relying on `CREATE TABLE IF NOT EXISTS`, which does nothing
- * to a table that already exists without the new column.
+ * Generic ADD-COLUMN-IF-MISSING guard for `ticklers` — idempotent, leaves existing data
+ * untouched. `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists
+ * without a newly-added column, so any column added after the schema first shipped needs
+ * one of these. Extracted as a reusable helper (rather than one hardcoded per column) so a
+ * sibling migration — #11 (nag) shares this exact need for its own new column — can call it
+ * directly instead of duplicating the PRAGMA/ALTER pair (issue #9 comment: "keep the
+ * ADD-COLUMN guard generic so both branches merge cleanly").
  */
-export function ensureRecurColumn(db: Database.Database): void {
+export function ensureColumn(db: Database.Database, columnName: string, sqlType: string): void {
   const columns = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
-  if (!columns.some((c) => c.name === "recur")) {
-    db.exec("ALTER TABLE ticklers ADD COLUMN recur TEXT");
+  if (!columns.some((c) => c.name === columnName)) {
+    db.exec(`ALTER TABLE ticklers ADD COLUMN ${columnName} ${sqlType}`);
   }
+}
+
+/** `recur`'s own instance of the generic guard above — kept as a named export since every
+ * existing call site (openDb, runMigration, tests) already calls it by this name. */
+export function ensureRecurColumn(db: Database.Database): void {
+  ensureColumn(db, "recur", "TEXT");
 }
 
 function openDb(dbPath: string): Database.Database {

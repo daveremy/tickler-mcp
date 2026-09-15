@@ -125,4 +125,15 @@ describe("cli: --recur parsing (codex round-4 code review, issue #9)", () => {
     }
     assert.ok(threw, 'weekly:SU:extra must be rejected, not silently truncated to "weekly:SU"');
   });
+
+  test("daily:2 is rejected instead of silently dropping the interval suffix (codex round-5)", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    let threw = false;
+    try {
+      cli(`create "recur CLI daily suffix" --due "${due}" --recur "daily:2" --tz "America/Phoenix"`);
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, 'daily:2 must be rejected — the CLI does not support an interval suffix on "daily"');
+  });
 });

@@ -36,6 +36,7 @@ import {
   normalizeStoredDueDates,
   TICKLERS_SCHEMA_SQL,
   ensureRecurColumn,
+  ensureColumn,
   formatTickler,
 } from "../src/store.js";
 import { resolveRecurForCreate, getWallTime } from "../src/recur.js";
@@ -786,6 +787,28 @@ describe("store: recur column migration (issue #9)", () => {
       | { title: string }
       | undefined;
     assert.ok(row, "the legacy row must have been imported");
+
+    db.close();
+    rmDb(dbPath);
+  });
+
+  test("ensureColumn is generic — a different column/type reuses the same guard a sibling migration would call (codex round-5)", () => {
+    // Simulates sibling #11 (nag) adding its own column via the same generic guard, per the
+    // issue's own "keep the ADD-COLUMN guard generic" request — not routed through
+    // ensureRecurColumn, which is now just ensureColumn("recur", "TEXT").
+    const dbPath = tmpDbPath("ensure-column-generic");
+    const db = new Database(dbPath);
+    db.exec(TICKLERS_SCHEMA_SQL); // already has recur, per the current schema
+
+    const columnsBefore = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(!columnsBefore.some((c) => c.name === "nag_count"), "nag_count must not pre-exist");
+
+    ensureColumn(db, "nag_count", "INTEGER");
+    const columnsAfter = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(columnsAfter.some((c) => c.name === "nag_count"), "nag_count must exist after ensureColumn");
+
+    // Idempotent, same contract as ensureRecurColumn.
+    assert.doesNotThrow(() => ensureColumn(db, "nag_count", "INTEGER"));
 
     db.close();
     rmDb(dbPath);

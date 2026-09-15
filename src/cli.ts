@@ -63,6 +63,14 @@ function parseRecurSpec(spec: string, tz: string): Recur {
       throw new RangeError(`Invalid day "${restRaw}" in --recur — expected an integer 1-31.`);
     }
     recur.byMonthDay = day;
+  } else if (restRaw !== undefined) {
+    // "daily" takes no ":" suffix — an interval belongs in the MCP tool's `interval` field,
+    // per this function's own doc comment. Before this fix "daily:2" silently succeeded and
+    // dropped the "2", building an interval:1 (every day) schedule instead of the interval:2
+    // the caller typed (codex round-5 code review, issue #9).
+    throw new RangeError(
+      `--recur "daily" does not take a ":" suffix — interval isn't supported from the CLI (use the MCP tool's interval field). Got "${spec}".`
+    );
   }
   return recur;
 }
