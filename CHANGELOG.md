@@ -22,11 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   migration guard (`pragma table_info` + `ALTER TABLE ... ADD COLUMN`) — existing rows read back
   with `recur: null`, byte-for-byte unchanged behavior when `recur` is omitted.
   - Timezone-aware occurrence math (`src/recur.ts`) uses only `Intl.DateTimeFormat` — no new
-    runtime dependency. Weekly `interval > 1` is documented as best-effort / globally
-    epoch-anchored rather than RFC 5545-complete series-anchored (the issue's tested scope is
-    `interval` defaulting to 1). A genuinely nonexistent (spring-forward gap) or ambiguous
-    (fall-back overlap) wall time has no designed resolution policy — this tickler's recurring
-    due times are ordinary times of day, never inside a transition's ~1:00-3:00am window.
+    runtime dependency. Weekly `interval > 1` alignment is anchored to the series' own previous
+    occurrence (not a fixed calendar epoch), so a biweekly rule stays biweekly regardless of
+    which week the series started in. A monthly rule's day-of-month is persisted explicitly at
+    creation (from the first occurrence when the caller omits `byMonthDay`), so it can never
+    drift after a clamped short month (e.g. day-31 surviving a February landing at day 28). A
+    genuinely nonexistent (spring-forward gap) or ambiguous (fall-back overlap) wall time has no
+    designed resolution policy — this tickler's recurring due times are ordinary times of day,
+    never inside a transition's ~1:00-3:00am window; this was reviewed and accepted at the plan
+    stage (out of scope: no acceptance criterion tests it).
 
 ### Fixed
 - **Ticklers fired up to a full UTC offset early** ([#3](https://github.com/daveremy/tickler-mcp/issues/3)).

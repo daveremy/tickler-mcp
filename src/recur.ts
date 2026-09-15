@@ -173,13 +173,6 @@ function daysInMonth(year: number, month: number): number {
   return new Date(Date.UTC(year, month, 0)).getUTCDate();
 }
 
-/** Fixed reference Sunday used only to give `interval`-week alignment a stable, global meaning. */
-const WEEK_EPOCH_MS = Date.UTC(1970, 0, 4); // 1970-01-04 was a Sunday
-
-function weekIndexFromEpoch(wall: WallTime): number {
-  return Math.floor((calDateToUtcMs(wall.year, wall.month, wall.day) - WEEK_EPOCH_MS) / (7 * 86400000));
-}
-
 /**
  * Is `wall` a date that satisfies `recur`'s day-selection rule (ignoring `interval`)?
  * `interval` alignment is checked separately by callers that need it (`nextOccurrence`);
@@ -218,6 +211,32 @@ export function firstOccurrence(recur: Recur, dueUtcIso: string): { due: string;
   throw new RangeError(`Could not find a valid first occurrence for recur ${JSON.stringify(recur)} near ${dueUtcIso}.`);
 }
 
+/**
+ * Validate `recur`, resolve the first occurrence (snapping forward if `due` doesn't already
+ * match), and — for monthly rules where the caller omitted `byMonthDay` — persist it explicitly
+ * from that first occurrence's day-of-month.
+ *
+ * This last step matters: `nextOccurrence`'s monthly branch always reads `recur.byMonthDay`
+ * verbatim rather than re-deriving a default from "whatever day the previous occurrence landed
+ * on". Without persisting an explicit day here, an omitted `byMonthDay` would silently drift
+ * after any clamped short month (Jan 31 -> Feb 28 -> Mar 28, instead of back to 31) — the
+ * `recur` object returned by THIS function is what must be stored, not the caller's original.
+ * Shared by `mcp.ts` and `cli.ts` so this isn't duplicated in both call sites.
+ */
+export function resolveRecurForCreate(
+  recur: Recur,
+  dueUtcIso: string
+): { recur: Recur; due: string; snapped: boolean } {
+  validateRecur(recur);
+  const { due, snapped } = firstOccurrence(recur, dueUtcIso);
+  let resolvedRecur = recur;
+  if (recur.freq === "monthly" && recur.byMonthDay === undefined) {
+    const wall = getWallTime(due, recur.tz);
+    resolvedRecur = { ...recur, byMonthDay: wall.day };
+  }
+  return { recur: resolvedRecur, due, snapped };
+}
+
 /** Compute the next occurrence strictly after `afterUtcIso`, per `recur`. */
 export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
   const wall = getWallTime(afterUtcIso, recur.tz);
@@ -232,11 +251,19 @@ export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
     const days = (recur.byWeekday?.length ? recur.byWeekday.map((w) => WEEKDAY_INDEX[w]) : [calWeekday(wall)])
       .slice()
       .sort((a, b) => a - b);
+    // Anchor `interval`-week alignment to `wall` (the occurrence we're advancing FROM), not a
+    // fixed global epoch — `wall` is itself always a valid occurrence, so a candidate is
+    // eligible when it falls in the same interval-week block as `wall` (0, interval,
+    // 2*interval, ... weeks after wall's own week). This makes the series self-consistent
+    // regardless of which week the series happened to start in (codex round-1 code review).
+    const wallMs = calDateToUtcMs(wall.year, wall.month, wall.day);
     let candidate = wall;
     const bound = interval * 7 + 7;
     for (let i = 0; i < bound; i++) {
       candidate = addCalDays(candidate, 1);
-      if (days.includes(calWeekday(candidate)) && weekIndexFromEpoch(candidate) % interval === 0) {
+      const candidateMs = calDateToUtcMs(candidate.year, candidate.month, candidate.day);
+      const weeksSinceWall = Math.floor((candidateMs - wallMs) / (7 * 86400000));
+      if (days.includes(calWeekday(candidate)) && weeksSinceWall % interval === 0) {
         return wallTimeToUtcIso(candidate, recur.tz);
       }
     }

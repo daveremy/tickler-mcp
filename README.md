@@ -60,9 +60,9 @@ npm install -g tickler-mcp
 ```
 
 - `freq`: `"daily" | "weekly" | "monthly"`.
-- `interval` (optional, default 1): repeat every N periods. Weekly `interval > 1` is best-effort
-  (globally week-aligned, not anchored to the series' own start week) — daily and monthly
-  intervals are exact.
+- `interval` (optional, default 1): repeat every N periods, anchored to the series' own previous
+  occurrence (not a fixed calendar epoch) — a weekly `interval: 2` rule always lands two weeks
+  after wherever the series actually started, whichever week that was.
 - `byWeekday` (weekly only): which weekdays, e.g. `["SU"]` or `["MO","WE","FR"]`.
 - `byMonthDay` (monthly only): day of month, 1-31. Clamped in short months (`31` on a 30-day month
   lands on the 30th) without losing the nominal day — the *next* month's occurrence still targets

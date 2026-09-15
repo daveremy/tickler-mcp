@@ -4,6 +4,7 @@ import {
   nextOccurrence,
   nextFutureOccurrence,
   firstOccurrence,
+  resolveRecurForCreate,
   isValidOccurrence,
   getWallTime,
   validateRecur,
@@ -32,6 +33,27 @@ describe("recur: weekly", () => {
       assert.equal(wall.hour, 7, `occurrence ${i} should read 07:00 in Phoenix`);
       assert.equal(due.slice(11, 13), "14", `occurrence ${i} should stay at a constant UTC offset (Phoenix has no DST)`);
       due = nextOccurrence(recur, due);
+    }
+  });
+
+  test("weekly interval:2 stays exactly 14 days apart regardless of which week the series started in (codex round-1)", () => {
+    const recur: Recur = { freq: "weekly", interval: 2, byWeekday: ["SU"], tz: "America/Phoenix" };
+    // Two series starting on different Sundays (different weeks relative to any fixed epoch) —
+    // if alignment were still keyed off a global epoch instead of the series' own start, one of
+    // these would drift to a 7-day cadence instead of staying at 14.
+    for (const start of ["2026-01-04T14:00:00.000Z", "2026-01-11T14:00:00.000Z"]) {
+      const first = nextOccurrence(recur, start);
+      const second = nextOccurrence(recur, first);
+      assert.equal(
+        (new Date(first).getTime() - new Date(start).getTime()) / 86400000,
+        14,
+        `series starting ${start}: first occurrence should be 14 days later`
+      );
+      assert.equal(
+        (new Date(second).getTime() - new Date(first).getTime()) / 86400000,
+        14,
+        `series starting ${start}: second occurrence should be another 14 days later`
+      );
     }
   });
 });
@@ -68,6 +90,28 @@ describe("recur: monthly", () => {
     const marWall = getWallTime(mar, "America/Phoenix");
     assert.equal(marWall.month, 3);
     assert.equal(marWall.day, 31, "the nominal day-31 rule must survive a clamped February, not drift to 28");
+  });
+
+  test("byMonthDay omitted: resolveRecurForCreate persists the default day so it survives a clamped February (codex round-1)", () => {
+    // No byMonthDay given — the default must be resolved ONCE at create time (from due's
+    // day-of-month) and persisted, not silently re-derived from each occurrence's own day.
+    const recur: Recur = { freq: "monthly", tz: "America/Phoenix" };
+    const jan31 = "2026-01-31T14:00:00.000Z"; // 07:00 Phoenix, day 31
+    const created = resolveRecurForCreate(recur, jan31);
+    assert.equal(created.snapped, false);
+    assert.equal(created.recur.byMonthDay, 31, "byMonthDay must be persisted as 31, not left undefined");
+
+    const feb = nextOccurrence(created.recur, created.due);
+    const febWall = getWallTime(feb, "America/Phoenix");
+    assert.equal(febWall.month, 2);
+    assert.equal(febWall.day, 28, "Feb 2026 has 28 days, so this occurrence clamps");
+
+    // The bug: a re-derived default (from Feb's clamped day 28) would keep the series pinned
+    // at 28 forever instead of returning to the nominal 31 once a 31-day month arrives.
+    const mar = nextOccurrence(created.recur, feb);
+    const marWall = getWallTime(mar, "America/Phoenix");
+    assert.equal(marWall.month, 3);
+    assert.equal(marWall.day, 31, "must return to day 31 in March, not drift to 28");
   });
 });
 

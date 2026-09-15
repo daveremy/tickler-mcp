@@ -17,7 +17,7 @@ import {
 } from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
-import { validateRecur, firstOccurrence, type Recur } from "./recur.js";
+import { resolveRecurForCreate, type Recur } from "./recur.js";
 
 const WEEKDAY_ENUM = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
 
@@ -66,14 +66,15 @@ server.tool(
     }
 
     let snappedNote = "";
+    let resolvedRecur: Recur | null = null;
     if (recur) {
       try {
-        validateRecur(recur as Recur);
-        const result = firstOccurrence(recur as Recur, due);
+        const result = resolveRecurForCreate(recur as Recur, due);
         if (result.snapped) {
           snappedNote = `\nNote: due did not match the recur rule — snapped forward to the first matching occurrence.`;
         }
         due = result.due;
+        resolvedRecur = result.recur;
       } catch (err) {
         return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
       }
@@ -89,7 +90,7 @@ server.tool(
       status: "pending",
       createdAt: new Date().toISOString(),
       completedAt: null,
-      recur: (recur as Recur | undefined) ?? null,
+      recur: resolvedRecur,
     };
 
     createTickler(tickler);

@@ -16,7 +16,7 @@ import {
 } from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
-import { validateRecur, firstOccurrence, type Recur, type Weekday } from "./recur.js";
+import { resolveRecurForCreate, type Recur, type Weekday } from "./recur.js";
 
 const WEEKDAY_CODES: Weekday[] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
 
@@ -131,11 +131,11 @@ program
         process.exit(1);
       }
       try {
-        recur = parseRecurSpec(opts.recur, opts.tz);
-        validateRecur(recur);
-        const result = firstOccurrence(recur, due);
+        const parsedRecur = parseRecurSpec(opts.recur, opts.tz);
+        const result = resolveRecurForCreate(parsedRecur, due);
         if (result.snapped) snappedNote = " (snapped forward to match the recur rule)";
         due = result.due;
+        recur = result.recur;
       } catch (err) {
         console.error(`Error: ${(err as Error).message}`);
         process.exit(1);
