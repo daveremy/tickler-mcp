@@ -19,10 +19,15 @@ export interface Recur {
    * ISO UTC instant of the series' very first occurrence, set once by `resolveRecurForCreate`
    * and never modified afterward (including by `tickler_snooze`, which only ever touches a
    * single occurrence's `due`, never its `recur`). This is the fixed, immutable reference
-   * `nextOccurrence` uses for weekly `interval`-week alignment and for the canonical
-   * time-of-day — so snoozing one occurrence to a different date/time can never leak into the
-   * schedule of later occurrences (codex round-2 code review, issue #9). Callers should never
-   * set this directly; it is server-derived.
+   * `nextOccurrence` and `formatRecur` use for interval-alignment, implicit weekday/day-of-
+   * month defaults, and the canonical time-of-day — so snoozing one occurrence to a different
+   * date/time can never leak into the schedule of later occurrences (codex round-2/round-3
+   * code review, issue #9). Optional ONLY on the way in — the raw shape an MCP client submits
+   * to `tickler_create`, before `resolveRecurForCreate` has run and derived it. Every stored
+   * `recur` has one; `nextOccurrence` and `formatRecur` both throw a clear `RangeError` rather
+   * than silently falling back to a possibly-snoozed instant if it is somehow missing (design
+   * review, issue #9 round 4 — a silent fallback here is what reintroduced the anchor bugs
+   * three rounds in a row). Callers should never set this directly; it is server-derived.
    */
   anchor?: string;
 }
@@ -251,72 +256,103 @@ export function resolveRecurForCreate(
     const wall = getWallTime(due, recur.tz);
     resolvedRecur = { ...resolvedRecur, byMonthDay: wall.day };
   }
-  if (resolvedRecur.anchor === undefined) {
-    resolvedRecur = { ...resolvedRecur, anchor: due };
-  }
+  // `anchor` is always the resolved first occurrence, unconditionally — it is server-derived
+  // and callers must never set it themselves (see the field's own doc comment).
+  resolvedRecur = { ...resolvedRecur, anchor: due };
   return { recur: resolvedRecur, due, snapped };
 }
 
-/** Compute the next occurrence strictly after `afterUtcIso`, per `recur`. */
+// Bounded walk-forward caps for nextOccurrence's daily/monthly branches (see doc comment on
+// nextOccurrence for why a plain forward walk replaced the earlier closed-form estimate).
+// Generous on purpose — cheap Intl-format iterations, not I/O — and sized so an interval:1
+// series can catch up from a decades-old anchor in one call: 100000 days ~= 270 years,
+// 5000 months ~= 416 years.
+const DAILY_WALK_CAP = 100000;
+const MONTHLY_WALK_CAP = 5000;
+
+/**
+ * Compute the next occurrence strictly after `afterUtcIso`, per `recur`.
+ *
+ * Everything here is measured from the series' fixed `recur.anchor` (its own first
+ * occurrence, set once by `resolveRecurForCreate`) — NEVER from `afterUtcIso`'s own wall
+ * time, except as the ">" comparison that picks which candidate to return. `afterUtcIso`
+ * for a completed occurrence may be a snoozed `due` on a different date and/or time than
+ * the series was ever meant to run on; a snooze must move only the snoozed occurrence
+ * itself, and every later occurrence must stay exactly where the anchor says it belongs
+ * (codex round-2/round-3 code review). `recur.anchor` is therefore required here — a recur
+ * without one has never been through `resolveRecurForCreate` and cannot be scheduled;
+ * silently falling back to `afterUtcIso`'s own wall time reintroduced every one of the bugs
+ * this anchor design exists to prevent (design review, issue #9 round 4), so this throws
+ * instead.
+ *
+ * Daily and monthly walk forward from the anchor in period-sized jumps, capped at
+ * `DAILY_WALK_CAP` / `MONTHLY_WALK_CAP`, rather than estimating a starting `k` with a
+ * closed-form approximation and correcting it — the estimate-and-correct shape was where two
+ * of the three anchor-related regressions actually lived (which variable seeded the
+ * calendar math), and a plain walk is simpler to verify correct by inspection while still
+ * cheap in the common case (`nextFutureOccurrence` below passes `max(afterUtcIso, now)`, so
+ * a typical call needs only a handful of iterations even for an old series).
+ */
 export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
-  const wall = getWallTime(afterUtcIso, recur.tz);
+  if (recur.anchor === undefined) {
+    throw new RangeError(
+      "nextOccurrence requires recur.anchor to be set — call resolveRecurForCreate at creation time first."
+    );
+  }
   const interval = recur.interval ?? 1;
+  if (!Number.isInteger(interval) || interval < 1) {
+    throw new RangeError(`Invalid recur.interval ${JSON.stringify(interval)} — must be an integer >= 1.`);
+  }
+  const anchorWall = getWallTime(recur.anchor, recur.tz);
   const afterMs = new Date(afterUtcIso).getTime();
-  // Every candidate's calendar schedule AND time-of-day are always measured from the series'
-  // fixed `recur.anchor` (its own first occurrence) when present, NEVER from `wall` — `wall`
-  // comes from `afterUtcIso`, which for a completed occurrence may be a snoozed `due` on a
-  // different date and/or time than the series was ever meant to run on. A snooze must move
-  // only the snoozed occurrence itself; every later occurrence stays exactly where the anchor
-  // says it belongs, regardless of freq (codex round-2/round-3 code review). Falls back to
-  // `wall` itself when no anchor is set (a recur that predates the anchor field, or a direct
-  // caller that skipped `resolveRecurForCreate`) — reproduces the exact pre-anchor behavior
-  // for that case, so it is not a regression there.
-  const anchorWall = recur.anchor !== undefined ? getWallTime(recur.anchor, recur.tz) : wall;
-  const anchorMs = new Date(recur.anchor ?? afterUtcIso).getTime();
   const timeOfDay = { hour: anchorWall.hour, minute: anchorWall.minute, second: anchorWall.second };
 
   if (recur.freq === "daily") {
-    const periodMs = interval * 86400000;
-    // Closed-form estimate of the smallest period count k with (anchor + k periods) >
-    // afterMs, corrected by a small bounded walk — cheap even when the anchor is years old,
-    // unlike rescanning day-by-day from the anchor every call.
-    const candidateAt = (k: number) => wallTimeToUtcIso({ ...addCalDays(anchorWall, k * interval), ...timeOfDay }, recur.tz);
-    let k = Math.max(0, Math.floor((afterMs - anchorMs) / periodMs));
-    while (k > 0 && new Date(candidateAt(k - 1)).getTime() > afterMs) k -= 1;
-    while (new Date(candidateAt(k)).getTime() <= afterMs) k += 1;
-    return candidateAt(k);
+    for (let k = 0; k < DAILY_WALK_CAP; k++) {
+      const candidate = wallTimeToUtcIso({ ...addCalDays(anchorWall, k * interval), ...timeOfDay }, recur.tz);
+      if (new Date(candidate).getTime() > afterMs) return candidate;
+    }
+    throw new RangeError(
+      `Could not find the next daily occurrence for recur ${JSON.stringify(recur)} after ${afterUtcIso} within ${DAILY_WALK_CAP} periods.`
+    );
   }
 
   if (recur.freq === "weekly") {
     // The implicit single-weekday default is derived from the ANCHOR's weekday, never from
-    // `wall`'s — otherwise snoozing an occurrence to a different day of the week would
+    // `afterUtcIso`'s — otherwise snoozing an occurrence to a different day of the week would
     // silently redefine which weekday an omitted `byWeekday` means going forward (codex
     // round-3 code review).
     const days = (recur.byWeekday?.length ? recur.byWeekday.map((w) => WEEKDAY_INDEX[w]) : [calWeekday(anchorWall)])
       .slice()
       .sort((a, b) => a - b);
-    // Interval-week alignment is measured from the FIXED anchor (or `wall` as a fallback, see
-    // above), never re-derived per call from whichever occurrence is being advanced from — a
-    // per-call reset breaks multi-weekday rules: advancing from a Monday can find that same
-    // active week's Wednesday first (correct), but a per-call anchor then treats THAT
-    // Wednesday as week 0 for its own call and matches the following Monday too, running
-    // every week instead of the intended interval (codex round-2 code review).
+    // Interval-week alignment is measured from the FIXED anchor, never re-derived per call
+    // from whichever occurrence is being advanced from — a per-call reset breaks
+    // multi-weekday rules: advancing from a Monday can find that same active week's
+    // Wednesday first (correct), but a per-call anchor then treats THAT Wednesday as week 0
+    // for its own call and matches the following Monday too, running every week instead of
+    // the intended interval (codex round-2 code review).
     const anchorWeekMs = calDateToUtcMs(anchorWall.year, anchorWall.month, anchorWall.day);
-    // The scan itself still starts from `wall` and walks forward day-by-day — that's fine and
-    // stays cheap (bounded at `interval*7+7` regardless of how old the anchor is) because
-    // phase is a modulo of a FIXED period, not a distance from the anchor.
-    let candidate = wall;
-    const bound = interval * 7 + 7;
-    for (let i = 0; i < bound; i++) {
-      candidate = addCalDays(candidate, 1);
+    // The scan starts at `afterUtcIso`'s own calendar date (day 0, so a later occurrence on
+    // the SAME day is reachable) and walks forward, testing the actual candidate INSTANT
+    // against `afterMs` rather than just its calendar day — a same-day-but-earlier
+    // `afterUtcIso` must be able to return a same-day occurrence, and near a DST transition
+    // "the day after" in wall terms is not reliably "later" in UTC terms (design review,
+    // issue #9 round 4). Bounded at `interval*7+8` regardless of how old the anchor is,
+    // because phase is a modulo of a FIXED period, not a distance from the anchor.
+    let candidate = getWallTime(afterUtcIso, recur.tz);
+    const bound = interval * 7 + 8;
+    for (let i = 0; i <= bound; i++) {
       const candidateMs = calDateToUtcMs(candidate.year, candidate.month, candidate.day);
       const weeksSinceAnchor = Math.floor((candidateMs - anchorWeekMs) / (7 * 86400000));
       // Modulo of a value that can be negative (a candidate before the anchor's own week, e.g.
-      // when `wall` predates `anchor`) must not be compared to 0 with JS's sign-preserving `%`.
+      // when `afterUtcIso` predates `anchor`) must not be compared to 0 with JS's
+      // sign-preserving `%`.
       const phase = ((weeksSinceAnchor % interval) + interval) % interval;
       if (days.includes(calWeekday(candidate)) && phase === 0) {
-        return wallTimeToUtcIso({ ...candidate, ...timeOfDay }, recur.tz);
+        const iso = wallTimeToUtcIso({ ...candidate, ...timeOfDay }, recur.tz);
+        if (new Date(iso).getTime() > afterMs) return iso;
       }
+      candidate = addCalDays(candidate, 1);
     }
     throw new RangeError(`Could not find the next weekly occurrence for recur ${JSON.stringify(recur)} after ${afterUtcIso}.`);
   }
@@ -324,45 +360,49 @@ export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
   // monthly
   const targetDay = recur.byMonthDay ?? anchorWall.day;
   const anchorMonthIndex = anchorWall.year * 12 + (anchorWall.month - 1);
-  const candidateAt = (k: number): string => {
+  for (let k = 0; k < MONTHLY_WALK_CAP; k++) {
     const idx = anchorMonthIndex + k * interval;
     const year = Math.floor(idx / 12);
     const month = (idx % 12) + 1;
     const day = Math.min(targetDay, daysInMonth(year, month));
-    return wallTimeToUtcIso({ ...anchorWall, year, month, day, ...timeOfDay }, recur.tz);
-  };
-  // Same closed-form-plus-correction approach as daily, in month units instead of days.
-  const approxMonthsPerPeriod = interval * 30.44 * 86400000; // rough; corrected below
-  let k = Math.max(0, Math.floor((afterMs - anchorMs) / approxMonthsPerPeriod));
-  while (k > 0 && new Date(candidateAt(k - 1)).getTime() > afterMs) k -= 1;
-  while (new Date(candidateAt(k)).getTime() <= afterMs) k += 1;
-  return candidateAt(k);
+    const candidate = wallTimeToUtcIso({ ...anchorWall, year, month, day, ...timeOfDay }, recur.tz);
+    if (new Date(candidate).getTime() > afterMs) return candidate;
+  }
+  throw new RangeError(
+    `Could not find the next monthly occurrence for recur ${JSON.stringify(recur)} after ${afterUtcIso} within ${MONTHLY_WALK_CAP} periods.`
+  );
 }
 
 /**
- * Walk `nextOccurrence` forward from `afterUtcIso` until the result is strictly after `nowUtcIso`
- * — "skip missed slots, never schedule in the past". Bounded so a pathological rule fails loudly
- * (RangeError) instead of looping forever.
+ * The next occurrence that is both strictly after `afterUtcIso` (the series' own schedule)
+ * and strictly after `nowUtcIso` ("skip missed slots, never schedule in the past") — i.e.
+ * `nextOccurrence(recur, max(afterUtcIso, nowUtcIso))`. `nextOccurrence` itself is one bounded
+ * walk from the anchor, so this needs no catch-up loop of its own: whichever of the two
+ * instants is later already determines every candidate `nextOccurrence` must skip past.
  */
 export function nextFutureOccurrence(recur: Recur, afterUtcIso: string, nowUtcIso: string): string {
-  let candidate = afterUtcIso;
-  const now = new Date(nowUtcIso).getTime();
-  for (let i = 0; i < 10000; i++) {
-    candidate = nextOccurrence(recur, candidate);
-    if (new Date(candidate).getTime() > now) {
-      return candidate;
-    }
-  }
-  throw new RangeError(`nextFutureOccurrence exceeded 10000 iterations for recur ${JSON.stringify(recur)} after ${afterUtcIso}.`);
+  const afterMs = new Date(afterUtcIso).getTime();
+  const nowMs = new Date(nowUtcIso).getTime();
+  return nextOccurrence(recur, afterMs > nowMs ? afterUtcIso : nowUtcIso);
 }
 
 /**
  * Human-readable summary, e.g. "weekly SU 07:00 America/Phoenix" or "monthly 15 07:00 America/Phoenix".
- * The displayed time-of-day comes from `dueUtcIso` read in `recur.tz` — the rule itself has no
- * standalone time field.
+ *
+ * The displayed time-of-day (and any implicit weekday/day-of-month) always comes from
+ * `recur.anchor`, never from a specific occurrence's `due` — otherwise a time-shifting
+ * snooze would change the DISPLAYED rule even though the real schedule didn't move (codex
+ * round-3 code review). Taking `recur` alone, rather than a caller-supplied due, removes the
+ * chance of a call site passing the wrong instant (design review, issue #9 round 4) — the
+ * old two-argument form fixed this correctly only at its one call site by convention.
  */
-export function formatRecur(recur: Recur, dueUtcIso: string): string {
-  const wall = getWallTime(dueUtcIso, recur.tz);
+export function formatRecur(recur: Recur): string {
+  if (recur.anchor === undefined) {
+    throw new RangeError(
+      "formatRecur requires recur.anchor to be set — call resolveRecurForCreate at creation time first."
+    );
+  }
+  const wall = getWallTime(recur.anchor, recur.tz);
   const hh = String(wall.hour).padStart(2, "0");
   const mm = String(wall.minute).padStart(2, "0");
   const time = `${hh}:${mm}`;

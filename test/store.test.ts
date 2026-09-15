@@ -178,9 +178,11 @@ describe("store: complete", () => {
   });
 
   test("completing the same occurrence twice is idempotent — no duplicate successor", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
     const t = makeTickler({
       title: "weekly-idempotent",
-      recur: { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" },
+      due,
+      recur: { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor: due },
     });
     createTickler(t);
 

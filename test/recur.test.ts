@@ -14,9 +14,9 @@ import {
 
 describe("recur: weekly", () => {
   test("weekly SU, interval 1: next occurrence is exactly 7 days later, same wall time", () => {
-    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" };
     // 2026-09-13 was a Sunday. 07:00 Phoenix = 14:00Z (Phoenix has no DST, fixed UTC-7).
     const due = "2026-09-13T14:00:00.000Z";
+    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor: due };
     const next = nextOccurrence(recur, due);
     assert.equal(next, "2026-09-20T14:00:00.000Z");
     const wall = getWallTime(next, "America/Phoenix");
@@ -25,9 +25,9 @@ describe("recur: weekly", () => {
   });
 
   test("Phoenix has no DST: the UTC offset stays constant across a DST-transition date range", () => {
-    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" };
     // 2026-03-01 (Sunday) 07:00 Phoenix, walk forward across the March 2026 US DST transition.
     let due = "2026-03-01T14:00:00.000Z"; // 07:00 MST (UTC-7)
+    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor: due };
     for (let i = 0; i < 5; i++) {
       const wall = getWallTime(due, "America/Phoenix");
       assert.equal(wall.hour, 7, `occurrence ${i} should read 07:00 in Phoenix`);
@@ -37,11 +37,11 @@ describe("recur: weekly", () => {
   });
 
   test("weekly interval:2 stays exactly 14 days apart regardless of which week the series started in (codex round-1)", () => {
-    const recur: Recur = { freq: "weekly", interval: 2, byWeekday: ["SU"], tz: "America/Phoenix" };
     // Two series starting on different Sundays (different weeks relative to any fixed epoch) —
     // if alignment were still keyed off a global epoch instead of the series' own start, one of
     // these would drift to a 7-day cadence instead of staying at 14.
     for (const start of ["2026-01-04T14:00:00.000Z", "2026-01-11T14:00:00.000Z"]) {
+      const recur: Recur = { freq: "weekly", interval: 2, byWeekday: ["SU"], tz: "America/Phoenix", anchor: start };
       const first = nextOccurrence(recur, start);
       const second = nextOccurrence(recur, first);
       assert.equal(
@@ -79,9 +79,9 @@ describe("recur: weekly", () => {
 
 describe("recur: DST boundary (America/New_York)", () => {
   test("07:00 New York stays 07:00 local across the spring-forward boundary, UTC offset shifts", () => {
-    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/New_York" };
     // 2026-03-01 is a Sunday, before the 2026 US spring-forward (second Sunday in March = 2026-03-08).
     let due = "2026-03-01T12:00:00.000Z"; // 07:00 EST = UTC-5 -> 12:00Z
+    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/New_York", anchor: due };
     const offsets: string[] = [];
     for (let i = 0; i < 4; i++) {
       const wall = getWallTime(due, "America/New_York");
@@ -139,8 +139,8 @@ describe("recur: snooze-independent scheduling (codex round-3)", () => {
 
 describe("recur: monthly", () => {
   test("byMonthDay 31 clamps in short months without losing the nominal day", () => {
-    const recur: Recur = { freq: "monthly", byMonthDay: 31, tz: "America/Phoenix" };
     const jan31 = "2026-01-31T14:00:00.000Z"; // 07:00 Phoenix
+    const recur: Recur = { freq: "monthly", byMonthDay: 31, tz: "America/Phoenix", anchor: jan31 };
     const feb = nextOccurrence(recur, jan31);
     // Feb 2026 has 28 days.
     const febWall = getWallTime(feb, "America/Phoenix");
@@ -178,8 +178,8 @@ describe("recur: monthly", () => {
 
 describe("recur: missed-slot skip", () => {
   test("nextFutureOccurrence skips past several missed weekly slots to the next FUTURE one", () => {
-    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" };
     const longAgo = "2020-01-05T14:00:00.000Z"; // a Sunday, far in the past
+    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor: longAgo };
     const now = "2026-09-15T00:00:00.000Z";
     const next = nextFutureOccurrence(recur, longAgo, now);
     assert.ok(new Date(next).getTime() > new Date(now).getTime(), "result must be strictly after now");
@@ -226,9 +226,60 @@ describe("recur: validation", () => {
 });
 
 describe("recur: formatRecur", () => {
-  test("formats a weekly rule with its time-of-day from due", () => {
-    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" };
+  test("formats a weekly rule with its time-of-day from the series anchor", () => {
     const due = "2026-09-13T14:00:00.000Z";
-    assert.equal(formatRecur(recur, due), "weekly SU 07:00 America/Phoenix");
+    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor: due };
+    assert.equal(formatRecur(recur), "weekly SU 07:00 America/Phoenix");
+  });
+});
+
+describe("recur: anchor is required for scheduling/display (design review, issue #9 round 4)", () => {
+  test("nextOccurrence throws a clear RangeError when recur.anchor is missing", () => {
+    const recur: Recur = { freq: "daily", tz: "America/Phoenix" };
+    assert.throws(() => nextOccurrence(recur, "2026-09-13T14:00:00.000Z"), /requires recur\.anchor/);
+  });
+
+  test("formatRecur throws a clear RangeError when recur.anchor is missing", () => {
+    const recur: Recur = { freq: "daily", tz: "America/Phoenix" };
+    assert.throws(() => formatRecur(recur), /requires recur\.anchor/);
+  });
+
+  test("nextOccurrence rejects a corrupted interval:0 instead of hanging", () => {
+    const anchor = "2026-09-13T14:00:00.000Z";
+    const recur: Recur = { freq: "monthly", interval: 0, tz: "America/Phoenix", anchor };
+    assert.throws(() => nextOccurrence(recur, anchor), RangeError);
+  });
+});
+
+describe("recur: interval combined with byMonthDay (design review, issue #9 round 4)", () => {
+  test("every 2 months on the 31st always clamps from the nominal day, skipping the months in between", () => {
+    const anchor = "2026-01-31T14:00:00.000Z"; // Jan 31, 07:00 Phoenix
+    const recur: Recur = { freq: "monthly", interval: 2, byMonthDay: 31, tz: "America/Phoenix", anchor };
+    const occurrences: Array<{ month: number; day: number }> = [];
+    let current = anchor;
+    for (let i = 0; i < 3; i++) {
+      current = nextOccurrence(recur, current);
+      const wall = getWallTime(current, "America/Phoenix");
+      occurrences.push({ month: wall.month, day: wall.day });
+    }
+    // Jan -> Mar (31) -> May (31) -> Jul (31); February/April/June are never visited, and the
+    // nominal day never drifts to a clamped one even though March/May/July all have 31 days.
+    assert.deepEqual(occurrences, [
+      { month: 3, day: 31 },
+      { month: 5, day: 31 },
+      { month: 7, day: 31 },
+    ]);
+  });
+});
+
+describe("recur: weekly can return a same-day later occurrence (design review, issue #9 round 4)", () => {
+  test("advancing from earlier the same day returns that same calendar day, not the day after", () => {
+    // Anchor Sunday 07:00 Phoenix. Advancing from 06:00 the same Sunday must return that same
+    // Sunday at 07:00 — the old day-granularity scan always skipped to the following week.
+    const anchor = "2026-09-13T14:00:00.000Z"; // Sunday 07:00 Phoenix
+    const recur: Recur = { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor };
+    const earlierSameDay = "2026-09-13T13:00:00.000Z"; // Sunday 06:00 Phoenix
+    const next = nextOccurrence(recur, earlierSameDay);
+    assert.equal(next, anchor, "must return the same Sunday's 07:00 occurrence, not skip to next week");
   });
 });
