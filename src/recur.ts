@@ -145,9 +145,12 @@ function offsetAtInstant(instantMs: number, tz: string): number {
  * It does NOT implement a designed policy for a genuinely nonexistent (spring-forward gap) or
  * genuinely ambiguous (fall-back overlap) wall time — past the iteration cap the loop simply
  * returns its last candidate (deterministic given the algorithm, but not a chosen policy for
- * that edge case). This tickler-mcp's recurring due times are ordinary times of day (e.g.
- * 07:00), never inside a transition's ~1:00-3:00am window, so the gap/overlap case is not
- * exercised by any acceptance criterion here; if it ever needs to be, an explicit policy
+ * that edge case). This is not exercised by any of this issue's acceptance criteria and was
+ * reviewed and accepted at the plan stage; note (design review, issue #9 round 4) that most
+ * US/EU zones transition in the small hours, but not all IANA zones do — America/Santiago,
+ * America/Havana, and Asia/Beirut transition at or near midnight, so an ordinary-looking daily
+ * due time like 00:30 can land inside the gap/overlap window there. If gap/overlap handling
+ * ever needs to be a designed policy
  * (e.g. "gap snaps forward past the transition; overlap picks the earlier instant") belongs
  * here as a deliberate addition, not folded silently into this convergence loop.
  */

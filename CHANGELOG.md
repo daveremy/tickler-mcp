@@ -32,9 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     creation (from the first occurrence when the caller omits `byMonthDay`), so it can never
     drift after a clamped short month (e.g. day-31 surviving a February landing at day 28). A
     genuinely nonexistent (spring-forward gap) or ambiguous (fall-back overlap) wall time has no
-    designed resolution policy — this tickler's recurring due times are ordinary times of day,
-    never inside a transition's ~1:00-3:00am window; this was reviewed and accepted at the plan
-    stage (out of scope: no acceptance criterion tests it).
+    designed resolution policy; this was reviewed and accepted at the plan stage (out of scope:
+    no acceptance criterion tests it). Most US/EU zones transition in the small hours, but a few
+    (America/Santiago, America/Havana, Asia/Beirut) transition at or near midnight, so an
+    ordinary-looking due time can still land in the gap/overlap window there.
+  - A design review (round 4) also found the anchor-based math didn't yet fully achieve
+    "schedule depends on `due` only as a `>` filter": `nextOccurrence`/`formatRecur` now throw
+    if `recur.anchor` is missing rather than silently falling back to the (possibly snoozed)
+    current occurrence's own wall time — the fallback had been the actual root cause of three
+    rounds of anchor-alignment bugs. The weekly branch now tests the candidate occurrence's
+    instant (not just its calendar day) against the search floor, so it can return a
+    same-day-but-later occurrence. `--recur` on the CLI now rejects a non-integer or trailing-
+    junk day, an extra `:`-separated segment, and an unsupported interval suffix on `daily`,
+    instead of silently building a different schedule than typed.
 
 ### Fixed
 - **Ticklers fired up to a full UTC offset early** ([#3](https://github.com/daveremy/tickler-mcp/issues/3)).
