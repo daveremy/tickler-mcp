@@ -38,6 +38,7 @@ import {
   getTickler,
   claimNagFire,
   ensureNagColumns,
+  formatTickler,
   TICKLERS_SCHEMA_SQL,
 } from "../src/store.js";
 import { resolveRecurForCreate } from "../src/recur.js";
@@ -170,6 +171,13 @@ describe("nag: exhaustion (max)", () => {
 
     const afterExhaustion = checkTicklers();
     assert.ok(!afterExhaustion.some((r) => r.id === t.id), "max:1 must exhaust immediately after its one fire");
+
+    const exhausted = getTickler(t.id)!;
+    assert.match(
+      formatTickler(exhausted),
+      /nag-exhausted/,
+      "exhaustion must be visible in the formatted display, not just in the returned data"
+    );
   });
 });
 
