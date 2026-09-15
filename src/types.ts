@@ -1,3 +1,6 @@
+export type { Recur, Weekday } from "./recur.js";
+import type { Recur } from "./recur.js";
+
 export interface Tickler {
   id: string;
   title: string;
@@ -8,6 +11,7 @@ export interface Tickler {
   status: "pending" | "done";
   createdAt: string;
   completedAt: string | null;
+  recur: Recur | null;
 }
 
 export interface TicklerStore {

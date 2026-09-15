@@ -16,6 +16,64 @@ import {
 } from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
+import { resolveRecurForCreate, type Recur, type Weekday } from "./recur.js";
+
+const WEEKDAY_CODES: Weekday[] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+
+/**
+ * Parse `--recur` CLI syntax: `daily`, `weekly:SU` (or `weekly:SU,TU`), `monthly:15`.
+ * An optional `:N` interval suffix on the freq itself is not supported from the CLI (use the
+ * MCP tool's `interval` field for that) — this mirrors the MCP schema's `Recur` shape, just
+ * flattened into one string plus the required `--tz` flag.
+ */
+function parseRecurSpec(spec: string, tz: string): Recur {
+  // Exactly one colon at most (freq, or freq:rest) — an extra colon (e.g. "weekly:SU:extra")
+  // must be rejected, not silently truncated by destructuring split(":") (codex round-4 code
+  // review, issue #9).
+  const parts = spec.split(":");
+  if (parts.length > 2) {
+    throw new RangeError(`Invalid --recur "${spec}" — expected "freq" or "freq:rest", found an extra ":".`);
+  }
+  const [freqRaw, restRaw] = parts;
+  const freq = freqRaw as Recur["freq"];
+  if (freq !== "daily" && freq !== "weekly" && freq !== "monthly") {
+    throw new RangeError(`Invalid --recur freq "${freqRaw}" — expected daily, weekly, or monthly.`);
+  }
+  const recur: Recur = { freq, tz };
+  if (freq === "weekly") {
+    if (!restRaw) throw new RangeError('--recur weekly needs a weekday, e.g. "weekly:SU"');
+    const days = restRaw.split(",").map((d) => d.trim().toUpperCase());
+    for (const d of days) {
+      if (!WEEKDAY_CODES.includes(d as Weekday)) {
+        throw new RangeError(`Invalid weekday "${d}" in --recur — expected one of ${WEEKDAY_CODES.join(",")}.`);
+      }
+    }
+    recur.byWeekday = days as Weekday[];
+  } else if (freq === "monthly") {
+    if (!restRaw) throw new RangeError('--recur monthly needs a day, e.g. "monthly:15"');
+    // `parseInt` alone accepts "1.5" (truncates to 1) and "15junk" (stops at the first
+    // non-digit) without error, silently building a different schedule than the caller typed
+    // (codex round-4 code review, issue #9) — require the ENTIRE token to be plain digits
+    // before converting.
+    if (!/^\d+$/.test(restRaw)) {
+      throw new RangeError(`Invalid day "${restRaw}" in --recur — expected an integer 1-31.`);
+    }
+    const day = parseInt(restRaw, 10);
+    if (!Number.isInteger(day) || day < 1 || day > 31) {
+      throw new RangeError(`Invalid day "${restRaw}" in --recur — expected an integer 1-31.`);
+    }
+    recur.byMonthDay = day;
+  } else if (restRaw !== undefined) {
+    // "daily" takes no ":" suffix — an interval belongs in the MCP tool's `interval` field,
+    // per this function's own doc comment. Before this fix "daily:2" silently succeeded and
+    // dropped the "2", building an interval:1 (every day) schedule instead of the interval:2
+    // the caller typed (codex round-5 code review, issue #9).
+    throw new RangeError(
+      `--recur "daily" does not take a ":" suffix — interval isn't supported from the CLI (use the MCP tool's interval field). Got "${spec}".`
+    );
+  }
+  return recur;
+}
 
 const program = new Command();
 
@@ -71,7 +129,9 @@ program
   .option("--body <body>", "Details or notes", "")
   .option("--tags <tags>", "Comma-separated tags (e.g. eng,clubexpress)")
   .option("--creator <creator>", "Who is creating this", "cli")
-  .action((title: string, opts: { due: string; body: string; tags?: string; creator: string }) => {
+  .option("--recur <spec>", 'Recurrence: "daily", "weekly:SU" (comma for multiple), or "monthly:15". Requires --tz.')
+  .option("--tz <zone>", "IANA timezone for --recur, e.g. America/Phoenix")
+  .action((title: string, opts: { due: string; body: string; tags?: string; creator: string; recur?: string; tz?: string }) => {
     // Normalize up front so the value printed back is the value stored.
     let due: string;
     try {
@@ -85,6 +145,25 @@ program
       ? opts.tags.split(",").map((t) => t.trim()).filter((t) => t.length > 0)
       : [];
 
+    let recur: Recur | null = null;
+    let snappedNote = "";
+    if (opts.recur) {
+      if (!opts.tz) {
+        console.error("Error: --recur requires --tz.");
+        process.exit(1);
+      }
+      try {
+        const parsedRecur = parseRecurSpec(opts.recur, opts.tz);
+        const result = resolveRecurForCreate(parsedRecur, due);
+        if (result.snapped) snappedNote = " (snapped forward to match the recur rule)";
+        due = result.due;
+        recur = result.recur;
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(1);
+      }
+    }
+
     const tickler: Tickler = {
       id: crypto.randomUUID(),
       title,
@@ -95,14 +174,16 @@ program
       status: "pending",
       createdAt: new Date().toISOString(),
       completedAt: null,
+      recur,
     };
 
     createTickler(tickler);
 
     console.log(`Created: ${tickler.id}`);
     console.log(`Title:   ${tickler.title}`);
-    console.log(`Due:     ${tickler.due}`);
+    console.log(`Due:     ${tickler.due}${snappedNote}`);
     if (tags.length > 0) console.log(`Tags:    ${tags.join(", ")}`);
+    if (recur) console.log(`Recur:   ${opts.recur} ${opts.tz}`);
     console.log(`Store:   ${getDbPath()}`);
   });
 
@@ -115,8 +196,11 @@ program
       console.error(`Error: No tickler found with ID "${id}"`);
       process.exit(1);
     }
-    completeTickler(id);
+    const result = completeTickler(id);
     console.log(`Marked complete: "${tickler.title}" (${id})`);
+    if (result.nextId) {
+      console.log(`Next occurrence: ${result.nextId}, due ${result.nextDue}`);
+    }
   });
 
 program

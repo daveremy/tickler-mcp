@@ -37,6 +37,7 @@ function makeTickler(overrides: Partial<Tickler> = {}): Tickler {
     status: "pending",
     createdAt: new Date().toISOString(),
     completedAt: null,
+    recur: null,
     ...overrides,
   };
 }
@@ -123,8 +124,8 @@ describe("mcp handler: tickler_complete", () => {
     assert.ok(found.completedAt !== null);
   });
 
-  test("returns false for nonexistent id", () => {
-    assert.equal(completeTickler("nonexistent"), false);
+  test("returns {completed:false} for nonexistent id", () => {
+    assert.equal(completeTickler("nonexistent").completed, false);
   });
 });
 

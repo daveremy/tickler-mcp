@@ -85,3 +85,55 @@ describe("cli: basic commands", () => {
     cleanup();
   });
 });
+
+describe("cli: --recur parsing (codex round-4 code review, issue #9)", () => {
+  test("a well-formed --recur monthly:15 creates a recurring tickler", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    const out = cli(`create "recur CLI valid" --due "${due}" --recur "monthly:15" --tz "America/Phoenix"`);
+    assert.match(out, /Created:/);
+  });
+
+  test("monthly:1.5 is rejected instead of silently truncating to day 1", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    let threw = false;
+    try {
+      cli(`create "recur CLI bad decimal" --due "${due}" --recur "monthly:1.5" --tz "America/Phoenix"`);
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, "monthly:1.5 must be rejected, not accepted as day 1");
+  });
+
+  test("monthly:15junk is rejected instead of silently parsing as day 15", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    let threw = false;
+    try {
+      cli(`create "recur CLI bad suffix" --due "${due}" --recur "monthly:15junk" --tz "America/Phoenix"`);
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, "monthly:15junk must be rejected, not accepted as day 15");
+  });
+
+  test("an extra colon segment is rejected instead of silently discarded", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    let threw = false;
+    try {
+      cli(`create "recur CLI extra colon" --due "${due}" --recur "weekly:SU:extra" --tz "America/Phoenix"`);
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, 'weekly:SU:extra must be rejected, not silently truncated to "weekly:SU"');
+  });
+
+  test("daily:2 is rejected instead of silently dropping the interval suffix (codex round-5)", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    let threw = false;
+    try {
+      cli(`create "recur CLI daily suffix" --due "${due}" --recur "daily:2" --tz "America/Phoenix"`);
+    } catch {
+      threw = true;
+    }
+    assert.ok(threw, 'daily:2 must be rejected — the CLI does not support an interval suffix on "daily"');
+  });
+});

@@ -17,6 +17,27 @@ import {
 } from "./store.js";
 import { parseDuration } from "./duration.js";
 import { VERSION } from "./version.js";
+import { resolveRecurForCreate, type Recur } from "./recur.js";
+
+const WEEKDAY_ENUM = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"] as const;
+
+const recurSchema = z
+  .object({
+    freq: z.enum(["daily", "weekly", "monthly"]).describe("Recurrence frequency"),
+    interval: z.number().int().min(1).optional().describe("Repeat every N periods (default 1)"),
+    byWeekday: z
+      .array(z.enum(WEEKDAY_ENUM))
+      .optional()
+      .describe("Weekly only: which weekdays (e.g. [\"SU\"])"),
+    byMonthDay: z.number().int().min(1).max(31).optional().describe("Monthly only: day of month (clamped in short months)"),
+    tz: z.string().describe("IANA timezone the rule's time-of-day is anchored to, e.g. America/Phoenix"),
+  })
+  .optional()
+  .describe(
+    "Optional recurrence rule. When present, `due` is the first occurrence (snapped forward " +
+      "to the next matching date if it doesn't already match the rule). Completing an " +
+      "occurrence creates the next one automatically."
+  );
 
 const server = new McpServer({ name: "tickler-mcp", version: VERSION });
 
@@ -33,14 +54,30 @@ server.tool(
     ),
     tags: z.array(z.string()).optional().describe("Optional tags for filtering (e.g. [\"eng\", \"clubexpress\"])"),
     creator: z.string().optional().describe("Agent or user creating this tickler (e.g. karpathy, marcus)"),
+    recur: recurSchema,
   },
-  async ({ title, body, due: dueInput, tags = [], creator = "unknown" }) => {
+  async ({ title, body, due: dueInput, tags = [], creator = "unknown", recur }) => {
     // Normalize up front so the value echoed back is the value stored.
     let due: string;
     try {
       due = normalizeDue(dueInput);
     } catch (err) {
       return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+    }
+
+    let snappedNote = "";
+    let resolvedRecur: Recur | null = null;
+    if (recur) {
+      try {
+        const result = resolveRecurForCreate(recur as Recur, due);
+        if (result.snapped) {
+          snappedNote = `\nNote: due did not match the recur rule — snapped forward to the first matching occurrence.`;
+        }
+        due = result.due;
+        resolvedRecur = result.recur;
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Error: ${(err as Error).message}` }], isError: true };
+      }
     }
 
     const tickler: Tickler = {
@@ -53,6 +90,7 @@ server.tool(
       status: "pending",
       createdAt: new Date().toISOString(),
       completedAt: null,
+      recur: resolvedRecur,
     };
 
     createTickler(tickler);
@@ -60,7 +98,7 @@ server.tool(
     return {
       content: [{
         type: "text" as const,
-        text: `Created tickler: ${tickler.id}\nTitle: ${tickler.title}\nDue: ${tickler.due}\nTags: ${tickler.tags.join(", ") || "none"}`,
+        text: `Created tickler: ${tickler.id}\nTitle: ${tickler.title}\nDue: ${tickler.due}\nTags: ${tickler.tags.join(", ") || "none"}${snappedNote}`,
       }],
     };
   },
@@ -112,8 +150,9 @@ server.tool(
     if (!tickler) {
       return { content: [{ type: "text" as const, text: `Error: No tickler found with ID "${id}"` }], isError: true };
     }
-    completeTickler(id);
-    return { content: [{ type: "text" as const, text: `Marked complete: "${tickler.title}" (${id})` }] };
+    const result = completeTickler(id);
+    const nextNote = result.nextId ? `\nNext occurrence created: ${result.nextId}, due ${result.nextDue}` : "";
+    return { content: [{ type: "text" as const, text: `Marked complete: "${tickler.title}" (${id})${nextNote}` }] };
   },
 );
 

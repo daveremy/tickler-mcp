@@ -40,12 +40,47 @@ npm install -g tickler-mcp
 
 | Tool | Description |
 |---|---|
-| `tickler_create` | Create a new tickler |
+| `tickler_create` | Create a new tickler. Accepts an optional `recur` rule — see below |
 | `tickler_check` | Return past-due pending ticklers (use in cron/morning review) |
 | `tickler_list` | List all ticklers, optionally filtered by status or tag |
-| `tickler_complete` | Mark a tickler done |
+| `tickler_complete` | Mark a tickler done. If it was recurring, also creates the next occurrence |
 | `tickler_delete` | Permanently remove a tickler |
 | `tickler_snooze` | Push due date forward by a duration: "1d", "3h", "1w", "30m" |
+
+### Recurring ticklers
+
+`tickler_create` takes an optional `recur` object instead of a plain `due`-only tickler:
+
+```json
+{
+  "freq": "weekly",
+  "byWeekday": ["SU"],
+  "tz": "America/Phoenix"
+}
+```
+
+- `freq`: `"daily" | "weekly" | "monthly"`.
+- `interval` (optional, default 1): repeat every N periods, anchored to the series' own fixed
+  first occurrence (not a fixed calendar epoch, and not whichever occurrence you're completing
+  right now) — a weekly `interval: 2` rule always lands two weeks after wherever the series
+  actually started, whichever week that was, even with multiple `byWeekday` entries. Snoozing
+  one occurrence to a different date or time never shifts the schedule of the occurrences that
+  follow it.
+- `byWeekday` (weekly only): which weekdays, e.g. `["SU"]` or `["MO","WE","FR"]`.
+- `byMonthDay` (monthly only): day of month, 1-31. Clamped in short months (`31` on a 30-day month
+  lands on the 30th) without losing the nominal day — the *next* month's occurrence still targets
+  the original day.
+- `tz` (required): IANA timezone the rule's time-of-day is anchored to. "07:00 every Sunday" stays
+  07:00 in `tz` across any DST transitions in that zone.
+
+`due` on create is the first occurrence. If it doesn't already match the rule, it's snapped
+forward to the next date that does, and the response says so.
+
+Completing a recurring occurrence (`tickler_complete`) marks it done and atomically creates the
+next pending occurrence — in `tz`, and never in the past (if several were missed, it skips
+straight to the next future slot). Only one pending occurrence exists per series at a time;
+deleting it ends the series (there's no separate "stop recurring" flag). `tickler_list` and the
+CLI show the rule inline: `↻ weekly SU 07:00 America/Phoenix`.
 
 ## CLI
 
@@ -64,7 +99,11 @@ tickler list --tag projects
 tickler create "Follow up on invoice" --due "2026-04-01T09:00:00-07:00" --body "Invoice #1042 sent March 26"
 tickler create "Weekly review" --due "2026-03-30T08:00:00-07:00" --tags "recurring,review"
 
-# Complete
+# Create, recurring: weekly on Sunday, monthly on the 15th, or daily.
+# --recur takes "daily", "weekly:SU" (comma-separate for multiple days), or "monthly:15" — --tz is required.
+tickler create "Pickleball registration" --due "2026-09-20T07:00:00" --recur "weekly:SU" --tz "America/Phoenix" --tags pickleball
+
+# Complete — if the tickler is recurring, this also creates the next occurrence
 tickler complete <id>
 
 # Delete

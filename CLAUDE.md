@@ -7,14 +7,16 @@ An MCP server + CLI for persistent ticklers/reminders. SQLite storage on disk (W
 
 ```
 src/
-  types.ts      — Tickler interface
+  types.ts      — Tickler interface (re-exports Recur/Weekday from recur.ts)
   store.ts      — SQLite store (better-sqlite3, WAL mode), JSON migration, CRUD exports
+  recur.ts      — Recurring-tickler rule + timezone-aware occurrence math (Intl.DateTimeFormat only, no new dep)
   mcp.ts        — MCP server (stdio transport, 6 tools)
   cli.ts        — CLI entry point (commander.js)
   duration.ts   — Duration string parser ("1d", "3h", "1w", "30m")
   version.ts    — Version constant (single source of truth)
 test/
   store.test.ts — Store unit tests (CRUD, migration, concurrent ops)
+  recur.test.ts — Recurring-tickler occurrence math (weekly/monthly/DST/missed-slot)
   mcp.test.ts   — MCP handler logic tests
   cli.test.ts   — CLI smoke tests
 ```

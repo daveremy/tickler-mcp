@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Recurring ticklers** ([#9](https://github.com/daveremy/tickler-mcp/issues/9)). `tickler_create`
+  and `tickler create --recur` accept an optional typed `recur` rule
+  (`{freq: "daily"|"weekly"|"monthly", interval?, byWeekday?, byMonthDay?, tz}`) instead of an
+  RRULE string — nothing here needs the RFC 5545 surface, and a typed shape is what an MCP client
+  can validate. `due` is still the first occurrence, snapped forward to the next matching date if
+  it doesn't already match the rule. Completing a recurring occurrence (`tickler_complete` /
+  `tickler complete`) atomically marks it done and creates exactly one next pending occurrence, in
+  `recur.tz`, skipping past any missed slots so the new due is never in the past. Deleting the
+  pending occurrence ends the series (no separate `stop_series` flag — one pending row per series
+  by construction). `tickler_list` / `formatTickler` / the CLI show the rule inline, e.g.
+  `↻ weekly SU 07:00 America/Phoenix`. New `recur TEXT` column, nullable, added via an idempotent
+  migration guard (`pragma table_info` + `ALTER TABLE ... ADD COLUMN`) — existing rows read back
+  with `recur: null`, byte-for-byte unchanged behavior when `recur` is omitted.
+  - Timezone-aware occurrence math (`src/recur.ts`) uses only `Intl.DateTimeFormat` — no new
+    runtime dependency. Each recurring series carries a fixed `recur.anchor` (its own first
+    occurrence, set once and never modified afterward), which every frequency's calendar
+    schedule and canonical time-of-day are always measured against — so a biweekly weekly rule
+    stays biweekly regardless of which week the series started in or how many weekdays it
+    names, and snoozing one occurrence (to a different date, a different time, or both) can
+    never shift the date, time, or displayed rule of the occurrences that follow it. A monthly
+    rule's day-of-month is persisted explicitly at
+    creation (from the first occurrence when the caller omits `byMonthDay`), so it can never
+    drift after a clamped short month (e.g. day-31 surviving a February landing at day 28). A
+    genuinely nonexistent (spring-forward gap) or ambiguous (fall-back overlap) wall time has no
+    designed resolution policy; this was reviewed and accepted at the plan stage (out of scope:
+    no acceptance criterion tests it). Most US/EU zones transition in the small hours, but a few
+    (America/Santiago, America/Havana, Asia/Beirut) transition at or near midnight, so an
+    ordinary-looking due time can still land in the gap/overlap window there.
+  - A design review (round 4) also found the anchor-based math didn't yet fully achieve
+    "schedule depends on `due` only as a `>` filter": `nextOccurrence`/`formatRecur` now throw
+    if `recur.anchor` is missing rather than silently falling back to the (possibly snoozed)
+    current occurrence's own wall time — the fallback had been the actual root cause of three
+    rounds of anchor-alignment bugs. The weekly branch now tests the candidate occurrence's
+    instant (not just its calendar day) against the search floor, so it can return a
+    same-day-but-later occurrence. `--recur` on the CLI now rejects a non-integer or trailing-
+    junk day, an extra `:`-separated segment, and an unsupported interval suffix on `daily`,
+    instead of silently building a different schedule than typed.
+
 ### Fixed
 - **Ticklers fired up to a full UTC offset early** ([#3](https://github.com/daveremy/tickler-mcp/issues/3)).
   `due` was stored exactly as supplied in a TEXT column, while `checkTicklers` compares it

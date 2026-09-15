@@ -35,7 +35,11 @@ import {
   normalizeDue,
   normalizeStoredDueDates,
   TICKLERS_SCHEMA_SQL,
+  ensureRecurColumn,
+  ensureColumn,
+  formatTickler,
 } from "../src/store.js";
+import { resolveRecurForCreate, getWallTime } from "../src/recur.js";
 import type { Tickler } from "../src/types.js";
 
 function makeTickler(overrides: Partial<Tickler> = {}): Tickler {
@@ -49,6 +53,7 @@ function makeTickler(overrides: Partial<Tickler> = {}): Tickler {
     status: "pending",
     createdAt: new Date().toISOString(),
     completedAt: null,
+    recur: null,
     ...overrides,
   };
 }
@@ -154,12 +159,13 @@ describe("store: check (overdue)", () => {
 });
 
 describe("store: complete", () => {
-  test("completeTickler marks as done and returns true", () => {
+  test("completeTickler marks as done, returns {completed:true}, no nextId for non-recurring", () => {
     const t = makeTickler({ title: "complete-me" });
     createTickler(t);
 
     const result = completeTickler(t.id);
-    assert.equal(result, true);
+    assert.equal(result.completed, true);
+    assert.equal(result.nextId, undefined);
 
     const found = getTickler(t.id);
     assert.ok(found);
@@ -167,9 +173,56 @@ describe("store: complete", () => {
     assert.ok(found.completedAt !== null, "completedAt should be set");
   });
 
-  test("completeTickler returns false for unknown id", () => {
+  test("completeTickler returns {completed:false} for unknown id", () => {
     const result = completeTickler("nonexistent-id");
-    assert.equal(result, false);
+    assert.equal(result.completed, false);
+  });
+
+  test("completing the same occurrence twice is idempotent — no duplicate successor", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    const t = makeTickler({
+      title: "weekly-idempotent",
+      due,
+      recur: { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix", anchor: due },
+    });
+    createTickler(t);
+
+    const first = completeTickler(t.id);
+    assert.equal(first.completed, true);
+    assert.ok(first.nextId, "first completion should create a successor");
+
+    const second = completeTickler(t.id);
+    assert.equal(second.completed, false, "second completion of an already-done tickler is a no-op");
+    assert.equal(second.nextId, undefined);
+
+    const all = listTicklers();
+    const successors = all.filter((x) => x.title === "weekly-idempotent" && x.id !== t.id);
+    assert.equal(successors.length, 1, "exactly one successor must exist, not two");
+  });
+
+  test("snoozing a recurring occurrence to a different time-of-day does not shift the SUCCESSOR's schedule (codex round-2)", () => {
+    // Series: weekly SU 07:00 America/Phoenix, created via resolveRecurForCreate so `recur`
+    // carries the series anchor. Snoozing the pending occurrence to 08:00 must affect only
+    // that occurrence — the next one, created on completion, must still land at 07:00, the
+    // series' own canonical time, not the snoozed 08:00.
+    const created = resolveRecurForCreate(
+      { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" },
+      "2026-09-13T14:00:00.000Z" // Sunday, 07:00 Phoenix
+    );
+    const t = makeTickler({ title: "snooze-then-complete", recur: created.recur, due: created.due });
+    createTickler(t);
+
+    const snoozedDue = new Date(new Date(created.due).getTime() + 3600000).toISOString(); // +1h -> 08:00
+    snoozeTickler(t.id, snoozedDue);
+    assert.equal(getTickler(t.id)?.due, snoozedDue, "the snooze itself must still take effect on this occurrence");
+
+    const result = completeTickler(t.id);
+    assert.ok(result.nextId, "completion of a recurring tickler must create a successor");
+    const next = getTickler(result.nextId!);
+    assert.ok(next);
+    const nextWall = getWallTime(next.due, "America/Phoenix");
+    assert.equal(nextWall.hour, 7, "the successor must fire at the series' canonical 07:00, not the snoozed 08:00");
+    assert.equal(nextWall.minute, 0);
   });
 });
 
@@ -222,6 +275,26 @@ describe("store: snooze", () => {
   test("snoozeTickler returns false for unknown id", () => {
     const result = snoozeTickler("nonexistent-id", new Date().toISOString());
     assert.equal(result, false);
+  });
+
+  test("formatTickler's displayed recur rule survives a snooze unchanged (codex round-3)", () => {
+    const created = resolveRecurForCreate(
+      { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" },
+      "2026-09-13T14:00:00.000Z" // Sunday, 07:00 Phoenix
+    );
+    const t = makeTickler({ title: "format-after-snooze", recur: created.recur, due: created.due });
+    createTickler(t);
+    assert.match(formatTickler(t), /↻ weekly SU 07:00 America\/Phoenix/);
+
+    const snoozedDue = new Date(new Date(created.due).getTime() + 3600000).toISOString(); // +1h -> 08:00
+    snoozeTickler(t.id, snoozedDue);
+    const snoozed = getTickler(t.id);
+    assert.ok(snoozed);
+    assert.match(
+      formatTickler(snoozed),
+      /↻ weekly SU 07:00 America\/Phoenix/,
+      "the displayed rule must still read 07:00 (the series' canonical time), not the snoozed 08:00"
+    );
   });
 });
 
@@ -622,5 +695,122 @@ describe("store: concurrent operations", () => {
     const all = listTicklers();
     const ours = all.filter((t) => t.title.startsWith(prefix));
     assert.equal(ours.length, count, `Expected ${count} ticklers, got ${ours.length}`);
+  });
+});
+
+describe("store: recur column migration (issue #9)", () => {
+  test("ensureRecurColumn adds recur to a pre-existing schema without touching data, and is idempotent", () => {
+    const dbPath = tmpDbPath("migration-recur");
+    // Build a DB with the OLD schema (no recur column), literally as it existed before #9.
+    const oldSchema = `
+      CREATE TABLE IF NOT EXISTS ticklers (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT,
+        due TEXT NOT NULL,
+        creator TEXT,
+        tags TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        snoozed_until TEXT
+      )
+    `;
+    const db = new Database(dbPath);
+    db.exec(oldSchema);
+    db.prepare(
+      "INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at) VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at)"
+    ).run({
+      id: "old-row-1",
+      title: "pre-existing tickler",
+      body: "",
+      due: new Date().toISOString(),
+      creator: "test",
+      tags: "[]",
+      status: "pending",
+      created_at: new Date().toISOString(),
+    });
+
+    const columnsBefore = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(!columnsBefore.some((c) => c.name === "recur"), "old schema must not already have recur");
+
+    ensureRecurColumn(db);
+    const columnsAfter = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(columnsAfter.some((c) => c.name === "recur"), "recur column must exist after migration");
+
+    const row = db.prepare("SELECT * FROM ticklers WHERE id = @id").get({ id: "old-row-1" }) as Record<string, unknown>;
+    assert.equal(row.title, "pre-existing tickler");
+    assert.equal(row.recur, null, "old rows read back with recur null");
+
+    // Idempotent: calling it again on an already-migrated DB must not throw.
+    assert.doesNotThrow(() => ensureRecurColumn(db));
+
+    db.close();
+    rmDb(dbPath);
+  });
+
+  test("runMigration guards the recur column itself on an already-open OLD-schema handle (codex round-4 code review)", () => {
+    // A caller can hand runMigration a Database.Database that was never opened through
+    // openDb (e.g. a fresh `new Database(path)` — exactly what sibling #11's migration path
+    // does). Before this fix, runMigration relied on the caller having already run
+    // ensureRecurColumn, and its INSERT (which always includes the recur column) failed with
+    // "no such column: recur" against a genuinely old schema.
+    const dbPath = tmpDbPath("migration-raw-handle");
+    const oldSchema = `
+      CREATE TABLE IF NOT EXISTS ticklers (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT,
+        due TEXT NOT NULL,
+        creator TEXT,
+        tags TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        snoozed_until TEXT
+      )
+    `;
+    const db = new Database(dbPath);
+    db.exec(oldSchema);
+    const columnsBefore = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(!columnsBefore.some((c) => c.name === "recur"), "old schema must not already have recur");
+
+    const jsonPath = path.join(os.tmpdir(), `ticklers-raw-handle-${crypto.randomUUID()}.json`);
+    const legacyTicklers: Tickler[] = [makeTickler({ title: "raw-handle-migration" })];
+    fs.writeFileSync(jsonPath, JSON.stringify({ ticklers: legacyTicklers }));
+
+    assert.doesNotThrow(() => runMigration(db, jsonPath), "runMigration must guard the column itself");
+
+    const columnsAfter = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(columnsAfter.some((c) => c.name === "recur"), "recur column must exist after runMigration");
+    const row = db.prepare("SELECT title FROM ticklers WHERE title = ?").get("raw-handle-migration") as
+      | { title: string }
+      | undefined;
+    assert.ok(row, "the legacy row must have been imported");
+
+    db.close();
+    rmDb(dbPath);
+  });
+
+  test("ensureColumn is generic — a different column/type reuses the same guard a sibling migration would call (codex round-5)", () => {
+    // Simulates sibling #11 (nag) adding its own column via the same generic guard, per the
+    // issue's own "keep the ADD-COLUMN guard generic" request — not routed through
+    // ensureRecurColumn, which is now just ensureColumn("recur", "TEXT").
+    const dbPath = tmpDbPath("ensure-column-generic");
+    const db = new Database(dbPath);
+    db.exec(TICKLERS_SCHEMA_SQL); // already has recur, per the current schema
+
+    const columnsBefore = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(!columnsBefore.some((c) => c.name === "nag_count"), "nag_count must not pre-exist");
+
+    ensureColumn(db, "nag_count", "INTEGER");
+    const columnsAfter = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(columnsAfter.some((c) => c.name === "nag_count"), "nag_count must exist after ensureColumn");
+
+    // Idempotent, same contract as ensureRecurColumn.
+    assert.doesNotThrow(() => ensureColumn(db, "nag_count", "INTEGER"));
+
+    db.close();
+    rmDb(dbPath);
   });
 });
