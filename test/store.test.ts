@@ -747,4 +747,47 @@ describe("store: recur column migration (issue #9)", () => {
     db.close();
     rmDb(dbPath);
   });
+
+  test("runMigration guards the recur column itself on an already-open OLD-schema handle (codex round-4 code review)", () => {
+    // A caller can hand runMigration a Database.Database that was never opened through
+    // openDb (e.g. a fresh `new Database(path)` — exactly what sibling #11's migration path
+    // does). Before this fix, runMigration relied on the caller having already run
+    // ensureRecurColumn, and its INSERT (which always includes the recur column) failed with
+    // "no such column: recur" against a genuinely old schema.
+    const dbPath = tmpDbPath("migration-raw-handle");
+    const oldSchema = `
+      CREATE TABLE IF NOT EXISTS ticklers (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT,
+        due TEXT NOT NULL,
+        creator TEXT,
+        tags TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        snoozed_until TEXT
+      )
+    `;
+    const db = new Database(dbPath);
+    db.exec(oldSchema);
+    const columnsBefore = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(!columnsBefore.some((c) => c.name === "recur"), "old schema must not already have recur");
+
+    const jsonPath = path.join(os.tmpdir(), `ticklers-raw-handle-${crypto.randomUUID()}.json`);
+    const legacyTicklers: Tickler[] = [makeTickler({ title: "raw-handle-migration" })];
+    fs.writeFileSync(jsonPath, JSON.stringify({ ticklers: legacyTicklers }));
+
+    assert.doesNotThrow(() => runMigration(db, jsonPath), "runMigration must guard the column itself");
+
+    const columnsAfter = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(columnsAfter.some((c) => c.name === "recur"), "recur column must exist after runMigration");
+    const row = db.prepare("SELECT title FROM ticklers WHERE title = ?").get("raw-handle-migration") as
+      | { title: string }
+      | undefined;
+    assert.ok(row, "the legacy row must have been imported");
+
+    db.close();
+    rmDb(dbPath);
+  });
 });

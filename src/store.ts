@@ -283,6 +283,13 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
 
   const db: Database.Database =
     typeof dbOrPath === "string" ? openDb(dbOrPath) : dbOrPath;
+  // `openDb` already runs the schema/column guards for the string-path branch above. The
+  // already-open-handle branch must run them too, defensively — a caller (this repo's own
+  // sibling #11 migration, or any future one) may hand `runMigration` a `Database.Database`
+  // that was never opened through `openDb`, and the INSERT below fails on a genuinely old
+  // schema without this (codex round-4 code review, issue #9). Both guards are idempotent.
+  db.exec(TICKLERS_SCHEMA_SQL);
+  ensureRecurColumn(db);
 
   const ticklers = Array.isArray(parsed.ticklers) ? parsed.ticklers : [];
 

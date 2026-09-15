@@ -27,7 +27,14 @@ const WEEKDAY_CODES: Weekday[] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
  * flattened into one string plus the required `--tz` flag.
  */
 function parseRecurSpec(spec: string, tz: string): Recur {
-  const [freqRaw, restRaw] = spec.split(":");
+  // Exactly one colon at most (freq, or freq:rest) — an extra colon (e.g. "weekly:SU:extra")
+  // must be rejected, not silently truncated by destructuring split(":") (codex round-4 code
+  // review, issue #9).
+  const parts = spec.split(":");
+  if (parts.length > 2) {
+    throw new RangeError(`Invalid --recur "${spec}" — expected "freq" or "freq:rest", found an extra ":".`);
+  }
+  const [freqRaw, restRaw] = parts;
   const freq = freqRaw as Recur["freq"];
   if (freq !== "daily" && freq !== "weekly" && freq !== "monthly") {
     throw new RangeError(`Invalid --recur freq "${freqRaw}" — expected daily, weekly, or monthly.`);
@@ -44,6 +51,13 @@ function parseRecurSpec(spec: string, tz: string): Recur {
     recur.byWeekday = days as Weekday[];
   } else if (freq === "monthly") {
     if (!restRaw) throw new RangeError('--recur monthly needs a day, e.g. "monthly:15"');
+    // `parseInt` alone accepts "1.5" (truncates to 1) and "15junk" (stops at the first
+    // non-digit) without error, silently building a different schedule than the caller typed
+    // (codex round-4 code review, issue #9) — require the ENTIRE token to be plain digits
+    // before converting.
+    if (!/^\d+$/.test(restRaw)) {
+      throw new RangeError(`Invalid day "${restRaw}" in --recur — expected an integer 1-31.`);
+    }
     const day = parseInt(restRaw, 10);
     if (!Number.isInteger(day) || day < 1 || day > 31) {
       throw new RangeError(`Invalid day "${restRaw}" in --recur — expected an integer 1-31.`);
