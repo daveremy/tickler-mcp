@@ -56,6 +56,25 @@ describe("recur: weekly", () => {
       );
     }
   });
+
+  test("weekly interval:2 with MULTIPLE weekdays stays on the correct active week, doesn't collapse to weekly (codex round-2)", () => {
+    // Mon+Wed, every 2 weeks: an anchor-less per-call phase check finds Wed 2 days after Mon
+    // (correct — same active week), but then treats THAT Wednesday as its own phase-zero and
+    // matches the FOLLOWING Monday too (5 days later) — collapsing interval:2 into interval:1.
+    const recur: Recur = { freq: "weekly", interval: 2, byWeekday: ["MO", "WE"], tz: "America/Phoenix" };
+    const created = resolveRecurForCreate(recur, "2026-09-14T14:00:00.000Z"); // Monday, 07:00 Phoenix
+    assert.equal(created.recur.anchor, created.due, "anchor must be set to the resolved first occurrence");
+
+    const occurrences: string[] = [created.due];
+    let current = created.due;
+    for (let i = 0; i < 5; i++) {
+      current = nextOccurrence(created.recur, current);
+      occurrences.push(current);
+    }
+    const days = occurrences.map((iso) => getWallTime(iso, "America/Phoenix").day);
+    // Active week 1: Mon 14, Wed 16. Skip week of 21/23. Active week 2: Mon 28, Wed 30.
+    assert.deepEqual(days, [14, 16, 28, 30, 12, 14], "must alternate Mon/Wed pairs, skipping every other week");
+  });
 });
 
 describe("recur: DST boundary (America/New_York)", () => {

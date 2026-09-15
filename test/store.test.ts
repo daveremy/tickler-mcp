@@ -37,6 +37,7 @@ import {
   TICKLERS_SCHEMA_SQL,
   ensureRecurColumn,
 } from "../src/store.js";
+import { resolveRecurForCreate, getWallTime } from "../src/recur.js";
 import type { Tickler } from "../src/types.js";
 
 function makeTickler(overrides: Partial<Tickler> = {}): Tickler {
@@ -193,6 +194,31 @@ describe("store: complete", () => {
     const all = listTicklers();
     const successors = all.filter((x) => x.title === "weekly-idempotent" && x.id !== t.id);
     assert.equal(successors.length, 1, "exactly one successor must exist, not two");
+  });
+
+  test("snoozing a recurring occurrence to a different time-of-day does not shift the SUCCESSOR's schedule (codex round-2)", () => {
+    // Series: weekly SU 07:00 America/Phoenix, created via resolveRecurForCreate so `recur`
+    // carries the series anchor. Snoozing the pending occurrence to 08:00 must affect only
+    // that occurrence — the next one, created on completion, must still land at 07:00, the
+    // series' own canonical time, not the snoozed 08:00.
+    const created = resolveRecurForCreate(
+      { freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" },
+      "2026-09-13T14:00:00.000Z" // Sunday, 07:00 Phoenix
+    );
+    const t = makeTickler({ title: "snooze-then-complete", recur: created.recur, due: created.due });
+    createTickler(t);
+
+    const snoozedDue = new Date(new Date(created.due).getTime() + 3600000).toISOString(); // +1h -> 08:00
+    snoozeTickler(t.id, snoozedDue);
+    assert.equal(getTickler(t.id)?.due, snoozedDue, "the snooze itself must still take effect on this occurrence");
+
+    const result = completeTickler(t.id);
+    assert.ok(result.nextId, "completion of a recurring tickler must create a successor");
+    const next = getTickler(result.nextId!);
+    assert.ok(next);
+    const nextWall = getWallTime(next.due, "America/Phoenix");
+    assert.equal(nextWall.hour, 7, "the successor must fire at the series' canonical 07:00, not the snoozed 08:00");
+    assert.equal(nextWall.minute, 0);
   });
 });
 

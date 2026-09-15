@@ -15,6 +15,16 @@ export interface Recur {
   byWeekday?: Weekday[];
   byMonthDay?: number;
   tz: string;
+  /**
+   * ISO UTC instant of the series' very first occurrence, set once by `resolveRecurForCreate`
+   * and never modified afterward (including by `tickler_snooze`, which only ever touches a
+   * single occurrence's `due`, never its `recur`). This is the fixed, immutable reference
+   * `nextOccurrence` uses for weekly `interval`-week alignment and for the canonical
+   * time-of-day — so snoozing one occurrence to a different date/time can never leak into the
+   * schedule of later occurrences (codex round-2 code review, issue #9). Callers should never
+   * set this directly; it is server-derived.
+   */
+  anchor?: string;
 }
 
 const WEEKDAY_CODES: Weekday[] = ["SU", "MO", "TU", "WE", "TH", "FR", "SA"];
@@ -213,14 +223,21 @@ export function firstOccurrence(recur: Recur, dueUtcIso: string): { due: string;
 
 /**
  * Validate `recur`, resolve the first occurrence (snapping forward if `due` doesn't already
- * match), and — for monthly rules where the caller omitted `byMonthDay` — persist it explicitly
- * from that first occurrence's day-of-month.
+ * match), and persist two things onto the returned `recur` that must never be silently
+ * re-derived later:
  *
- * This last step matters: `nextOccurrence`'s monthly branch always reads `recur.byMonthDay`
- * verbatim rather than re-deriving a default from "whatever day the previous occurrence landed
- * on". Without persisting an explicit day here, an omitted `byMonthDay` would silently drift
- * after any clamped short month (Jan 31 -> Feb 28 -> Mar 28, instead of back to 31) — the
- * `recur` object returned by THIS function is what must be stored, not the caller's original.
+ * 1. For monthly rules where the caller omitted `byMonthDay` — the day-of-month, from that
+ *    first occurrence. `nextOccurrence`'s monthly branch always reads `recur.byMonthDay`
+ *    verbatim rather than re-deriving a default from "whatever day the previous occurrence
+ *    landed on". Without persisting an explicit day here, an omitted `byMonthDay` would
+ *    silently drift after any clamped short month (Jan 31 -> Feb 28 -> Mar 28, instead of back
+ *    to 31).
+ * 2. `anchor` (if not already set) — the resolved first occurrence itself. `nextOccurrence`
+ *    uses this as the fixed reference for weekly `interval`-week alignment and for the
+ *    series' canonical time-of-day, so a later `tickler_snooze` on any one occurrence's `due`
+ *    can never shift the schedule of the occurrences that follow it.
+ *
+ * The `recur` object this function returns is what must be stored, not the caller's original.
  * Shared by `mcp.ts` and `cli.ts` so this isn't duplicated in both call sites.
  */
 export function resolveRecurForCreate(
@@ -232,7 +249,10 @@ export function resolveRecurForCreate(
   let resolvedRecur = recur;
   if (recur.freq === "monthly" && recur.byMonthDay === undefined) {
     const wall = getWallTime(due, recur.tz);
-    resolvedRecur = { ...recur, byMonthDay: wall.day };
+    resolvedRecur = { ...resolvedRecur, byMonthDay: wall.day };
+  }
+  if (resolvedRecur.anchor === undefined) {
+    resolvedRecur = { ...resolvedRecur, anchor: due };
   }
   return { recur: resolvedRecur, due, snapped };
 }
@@ -241,9 +261,18 @@ export function resolveRecurForCreate(
 export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
   const wall = getWallTime(afterUtcIso, recur.tz);
   const interval = recur.interval ?? 1;
+  // The canonical reference for BOTH weekly interval-week alignment and the series'
+  // time-of-day is `recur.anchor` (the series' fixed first occurrence) when present, never
+  // `wall` — `wall` comes from `afterUtcIso`, which for a completed occurrence may be a
+  // snoozed `due` with a different date and/or time-of-day than the series was ever meant to
+  // run on. Falls back to `wall` itself when no anchor is set (a recur that predates the
+  // anchor field, or a direct caller that skipped `resolveRecurForCreate`) — this reproduces
+  // the exact pre-anchor behavior, so it is not a regression for that case.
+  const anchorWall = recur.anchor !== undefined ? getWallTime(recur.anchor, recur.tz) : wall;
+  const timeOfDay = { hour: anchorWall.hour, minute: anchorWall.minute, second: anchorWall.second };
 
   if (recur.freq === "daily") {
-    const candidate = addCalDays(wall, interval);
+    const candidate = { ...addCalDays(wall, interval), ...timeOfDay };
     return wallTimeToUtcIso(candidate, recur.tz);
   }
 
@@ -251,20 +280,24 @@ export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
     const days = (recur.byWeekday?.length ? recur.byWeekday.map((w) => WEEKDAY_INDEX[w]) : [calWeekday(wall)])
       .slice()
       .sort((a, b) => a - b);
-    // Anchor `interval`-week alignment to `wall` (the occurrence we're advancing FROM), not a
-    // fixed global epoch — `wall` is itself always a valid occurrence, so a candidate is
-    // eligible when it falls in the same interval-week block as `wall` (0, interval,
-    // 2*interval, ... weeks after wall's own week). This makes the series self-consistent
-    // regardless of which week the series happened to start in (codex round-1 code review).
-    const wallMs = calDateToUtcMs(wall.year, wall.month, wall.day);
+    // Interval-week alignment is measured from the FIXED anchor (or `wall` as a fallback, see
+    // above), never re-derived per call from whichever occurrence is being advanced from — a
+    // per-call reset breaks multi-weekday rules: advancing from a Monday can find that same
+    // active week's Wednesday first (correct), but a per-call anchor then treats THAT
+    // Wednesday as week 0 for its own call and matches the following Monday too, running
+    // every week instead of the intended interval (codex round-2 code review).
+    const anchorMs = calDateToUtcMs(anchorWall.year, anchorWall.month, anchorWall.day);
     let candidate = wall;
     const bound = interval * 7 + 7;
     for (let i = 0; i < bound; i++) {
       candidate = addCalDays(candidate, 1);
       const candidateMs = calDateToUtcMs(candidate.year, candidate.month, candidate.day);
-      const weeksSinceWall = Math.floor((candidateMs - wallMs) / (7 * 86400000));
-      if (days.includes(calWeekday(candidate)) && weeksSinceWall % interval === 0) {
-        return wallTimeToUtcIso(candidate, recur.tz);
+      const weeksSinceAnchor = Math.floor((candidateMs - anchorMs) / (7 * 86400000));
+      // Modulo of a value that can be negative (a candidate before the anchor's own week, e.g.
+      // when `wall` predates `anchor`) must not be compared to 0 with JS's sign-preserving `%`.
+      const phase = ((weeksSinceAnchor % interval) + interval) % interval;
+      if (days.includes(calWeekday(candidate)) && phase === 0) {
+        return wallTimeToUtcIso({ ...candidate, ...timeOfDay }, recur.tz);
       }
     }
     throw new RangeError(`Could not find the next weekly occurrence for recur ${JSON.stringify(recur)} after ${afterUtcIso}.`);
@@ -276,7 +309,7 @@ export function nextOccurrence(recur: Recur, afterUtcIso: string): string {
   const targetYear = Math.floor(targetMonthIndex / 12);
   const targetMonth = (targetMonthIndex % 12) + 1;
   const day = Math.min(targetDay, daysInMonth(targetYear, targetMonth));
-  const candidate: WallTime = { ...wall, year: targetYear, month: targetMonth, day };
+  const candidate: WallTime = { ...wall, year: targetYear, month: targetMonth, day, ...timeOfDay };
   return wallTimeToUtcIso(candidate, recur.tz);
 }
 
