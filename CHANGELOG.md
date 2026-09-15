@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-15
+
 ### Added
 - **Nag ticklers** ([#10](https://github.com/daveremy/tickler-mcp/issues/10)). `tickler_create` /
   `tickler create --nag <duration> [--nag-max <n>]` accept an optional `nag` rule
@@ -137,7 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Claude Code plugin packaging (`.claude-plugin/plugin.json`)
 - `CLAUDE.md` dev guide
 
-[Unreleased]: https://github.com/daveremy/tickler-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/daveremy/tickler-mcp/compare/v1.2.0...HEAD
 [0.2.0]: https://github.com/daveremy/tickler-mcp/compare/v1.0.1...v0.2.0
 [1.0.1]: https://github.com/daveremy/tickler-mcp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/daveremy/tickler-mcp/releases/tag/v1.0.0
+[1.2.0]: https://github.com/daveremy/tickler-mcp/releases/tag/v1.2.0
