@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import * as crypto from "crypto";
-import type { Tickler, Nag } from "./types.js";
+import type { Tickler, Nag, NotifyChannel } from "./types.js";
 import {
   createTickler,
   listTicklers,
   checkTicklers,
+  checkNotifyDue,
+  claimNotifyFire,
   completeTickler,
   deleteTickler,
   snoozeTickler,
@@ -86,7 +88,26 @@ program
   .command("check")
   .description("Show past-due pending ticklers (exit 1 if any are due, 0 if none). A due nag tickler is shown again once its interval elapses, until completed or exhausted.")
   .option("--no-mark-fired", "dry read — don't advance nag state (lastFiredAt/fire count)")
-  .action((opts: { markFired: boolean }) => {
+  .option("--notify-due", "Return due telegram:dave ticklers as JSON (read-only) instead of the normal agent check")
+  .action((opts: { markFired: boolean; notifyDue?: boolean }) => {
+    // Full alternative branch, checked first: the Telegram poller's read must never touch
+    // the agent path's mark-fired logic (or anything else in this action).
+    if (opts.notifyDue) {
+      // Wrapped so a DB/open error exits 2, distinct from exit 1's "items are due" — a
+      // poller reading only the exit code must be able to tell "crashed" from "nothing
+      // urgent" (round-1 code review finding: both shared exit 1 before this fix).
+      try {
+        const due = checkNotifyDue();
+        // Read-only on purpose — the poller sends first, then claims via notify-mark-fired,
+        // so a failed send leaves the tickler due rather than losing it.
+        console.log(JSON.stringify(due.map(t => ({ id: t.id, title: t.title, body: t.body, due: t.due, lastFiredAt: t.lastFiredAt })), null, 2));
+        process.exit(due.length > 0 ? 1 : 0);
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(2);
+      }
+    }
+
     const overdue = checkTicklers(opts.markFired);
 
     if (overdue.length === 0) {
@@ -96,6 +117,35 @@ program
     console.log(`${overdue.length} past-due tickler(s):\n`);
     overdue.forEach((t) => console.log(formatTickler(t) + "\n"));
     process.exit(1);
+  });
+
+program
+  .command("notify-mark-fired <id>")
+  .description("Claim a notify-due fire for <id> after a confirmed send (tickler-mcp#11). Exit 0 = claimed, 1 = lost race/no longer eligible, 2 = usage/DB error.")
+  .requiredOption("--prev-fired-at <value>", 'The lastFiredAt token from `check --notify-due` JSON output — pass "none" (or "null", or an empty string) if it was null')
+  .action((id: string, opts: { prevFiredAt: string }) => {
+    // Accept "none", "null" and "" as the null token, not just the literal "none" the
+    // description asks for — `jq -r '.[].lastFiredAt'` on a JSON `null` prints the text
+    // "null", not "none", so the obvious shell pipeline a caller reaches for would
+    // otherwise silently pass a wrong token through as a literal string compare that
+    // matches no row (round-1 code review finding, BLOCKING: this previously caused an
+    // eligible tickler to read exit 1 "lost race", the same code path as a real lost
+    // race, and never get marked fired — a false-pass that resent the tickler forever).
+    const NULL_TOKENS = new Set(["none", "null", ""]);
+    const prev = NULL_TOKENS.has(opts.prevFiredAt) ? null : opts.prevFiredAt;
+    try {
+      const claimed = claimNotifyFire(id, prev, new Date().toISOString());
+      if (claimed) {
+        console.log(`Claimed: ${id}`);
+        process.exit(0);
+      } else {
+        console.error(`Not claimed (lost race or no longer eligible): ${id}`);
+        process.exit(1);
+      }
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exit(2);
+    }
   });
 
 program
@@ -134,7 +184,14 @@ program
   .option("--tz <zone>", "IANA timezone for --recur, e.g. America/Phoenix")
   .option("--nag <duration>", 'Re-fire every duration once due, e.g. "1d", "4h", until completed. Cadences under 1d only fire once/day until tickler-mcp#11 lands.')
   .option("--nag-max <n>", "Total nag fires before exhaustion (requires --nag)")
-  .action((title: string, opts: { due: string; body: string; tags?: string; creator: string; recur?: string; tz?: string; nag?: string; nagMax?: string }) => {
+  .option("--notify <channel>", 'Notification channel: "agent" (default) or "telegram:dave"', "agent")
+  .action((title: string, opts: { due: string; body: string; tags?: string; creator: string; recur?: string; tz?: string; nag?: string; nagMax?: string; notify: string }) => {
+    if (opts.notify !== "agent" && opts.notify !== "telegram:dave") {
+      console.error('Error: --notify must be "agent" or "telegram:dave"');
+      process.exit(1);
+    }
+    const notify: NotifyChannel = opts.notify;
+
     // Normalize up front so the value printed back is the value stored.
     let due: string;
     try {
@@ -199,6 +256,7 @@ program
       due,
       tags,
       creator: opts.creator,
+      notify,
       status: "pending",
       createdAt: new Date().toISOString(),
       completedAt: null,
@@ -216,6 +274,7 @@ program
     if (tags.length > 0) console.log(`Tags:    ${tags.join(", ")}`);
     if (recur) console.log(`Recur:   ${opts.recur} ${opts.tz}`);
     if (nag) console.log(`Nag:     every ${nag.every}${nag.max !== undefined ? ` (max ${nag.max})` : ""}`);
+    if (notify !== "agent") console.log(`Notify:  ${notify}`);
     console.log(`Store:   ${getDbPath()}`);
   });
 

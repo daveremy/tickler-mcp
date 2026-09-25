@@ -119,10 +119,35 @@ reset to 0) — it does not inherit the completed occurrence's fire history.
 
 ⚠️ **Sub-1-day cadences are capped by your polling frequency.** `every` shorter than a day (e.g.
 `"4h"`) only actually re-fires as often as whatever calls `tickler_check` — typically once per
-day via a morning review route. A due-time poller that fires exactly on schedule
-([tickler-mcp#11](https://github.com/daveremy/tickler-mcp/issues/11)) is not implemented yet;
-until then, a sub-daily `every` degrades to "fires once per polling cycle," not its literal
-interval.
+day via a morning review route. The `agent` channel still works this way. A `telegram:dave`
+tickler is delivered by a due-time poller instead — see below — so its cadence is bounded by
+that poller's own interval, not by an agent session.
+
+### Telegram delivery (`notify: "telegram:dave"`)
+
+`tickler_create` / `tickler create` take an optional `notify` channel — `"agent"` (default,
+today's behavior: surfaced via `tickler_check` in an agent session) or `"telegram:dave"`
+([tickler-mcp#11](https://github.com/daveremy/tickler-mcp/issues/11)). A `telegram:dave`
+tickler is never returned by the agent-facing `tickler_check` / `tickler check` — it is
+delivered by a separate due-time poller instead (in this repo's case, a lifeos job that polls
+every ~15 min; see that repo's `scripts/jobs/tickler-telegram-notify.sh`).
+
+The poller uses a two-phase read/claim, both exposed on the CLI:
+
+1. `tickler check --notify-due` — a **read-only** JSON dump of due `telegram:dave` ticklers
+   (`id`, `title`, `body`, `due`, `lastFiredAt`). Exit 1 if any are due, 0 if none, 2 on error.
+   It never marks anything fired.
+2. After a **confirmed** send, the poller calls `tickler notify-mark-fired <id>
+   --prev-fired-at <token>`, where `<token>` is that tickler's `lastFiredAt` from step 1 (pass
+   `"none"`, `"null"`, or an empty string if it was `null`). This is a compare-and-swap claim:
+   exit 0 = claimed, 1 = lost race / no longer eligible (already fired by a concurrent run, no
+   longer due, etc. — safe to skip), 2 = usage/DB error.
+
+A failed send therefore never marks the tickler fired — it stays due and is retried on the
+poller's next pass, rather than being lost. A non-nag `telegram:dave` tickler fires exactly
+once, ever, since nothing re-polls it into anyone's attention the way an agent session's
+`tickler_check` does; a nagging `telegram:dave` tickler re-fires per its own `nag.every`/`max`,
+same rule as the `agent` channel.
 
 ## CLI
 

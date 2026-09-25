@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Telegram delivery: `notify` field + `--notify-due` / `notify-mark-fired`**
+  ([#11](https://github.com/daveremy/tickler-mcp/issues/11)). `tickler_create` / `tickler
+  create --notify <agent|telegram:dave>` accept an optional notification channel, default
+  `agent` (today's behavior, unchanged). A new read-only `tickler check --notify-due` mode
+  returns due `telegram:dave` ticklers as JSON (`id`, `title`, `body`, `due`, `lastFiredAt`;
+  exit 1 if any are due, 0 if none, 2 on error) for an external poller to consume. The poller
+  claims a fire only AFTER a confirmed send, via `tickler notify-mark-fired <id>
+  --prev-fired-at <token>` (a compare-and-swap on the `lastFiredAt` token the read step
+  handed back; exit 0 = claimed, 1 = lost race/no longer eligible, 2 = usage/DB error) — a
+  failed send therefore leaves the tickler due rather than losing it. A non-nag `telegram:dave`
+  tickler fires exactly once; a nagging one re-fires per its own `nag.every`/`max`, same as
+  the agent path. `tickler_check` / `tickler check` (the existing agent-facing path) now
+  excludes `notify: "telegram:dave"` rows, so an agent session never silently consumes a
+  Telegram tickler's nag fire or double-surfaces it. Stored as a new `notify TEXT NOT NULL
+  DEFAULT 'agent'` column, added via the existing `ensureColumn` migration guard. The lifeos
+  poller job that consumes this surface is tracked separately in the lifeos repo.
+
 ## [1.2.0] - 2026-09-15
 
 ### Added

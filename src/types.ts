@@ -10,6 +10,14 @@ export interface Nag {
   max?: number; // total fires before exhaustion; omitted = unlimited
 }
 
+/**
+ * Where a due tickler is delivered (tickler-mcp#11). `"agent"` is the default and
+ * the only channel `tickler_check` has ever surfaced; `"telegram:dave"` is read by a
+ * separate Telegram poller (`tickler check --notify-due` + `tickler notify-mark-fired`)
+ * and never appears in an agent session's check.
+ */
+export type NotifyChannel = "agent" | "telegram:dave";
+
 export interface Tickler {
   id: string;
   title: string;
@@ -17,6 +25,7 @@ export interface Tickler {
   due: string; // ISO 8601
   tags: string[];
   creator: string;
+  notify: NotifyChannel;
   status: "pending" | "done";
   createdAt: string;
   completedAt: string | null;

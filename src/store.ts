@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import * as crypto from "crypto";
-import type { Tickler, Nag } from "./types.js";
+import type { Tickler, Nag, NotifyChannel } from "./types.js";
 import type { Recur } from "./recur.js";
 import { formatRecur, nextFutureOccurrence } from "./recur.js";
 import { parseDuration } from "./duration.js";
@@ -125,6 +125,7 @@ export const TICKLERS_SCHEMA_SQL = `
     body TEXT,
     due TEXT NOT NULL,
     creator TEXT,
+    notify TEXT NOT NULL DEFAULT 'agent',
     tags TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
     created_at TEXT NOT NULL,
@@ -174,6 +175,13 @@ export function ensureNagColumns(db: Database.Database): void {
   ensureColumn(db, "nag_fire_count", "INTEGER NOT NULL DEFAULT 0");
 }
 
+/** `notify`'s own instance of the generic guard above (tickler-mcp#11). NOT NULL DEFAULT
+ * 'agent' so a pre-existing row — which predates the column and so the whole channel — reads
+ * back as agent-delivered, exactly the behavior it was written under. */
+export function ensureNotifyColumn(db: Database.Database): void {
+  ensureColumn(db, "notify", "TEXT NOT NULL DEFAULT 'agent'");
+}
+
 function openDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
   db.pragma("journal_mode = WAL");
@@ -181,6 +189,7 @@ function openDb(dbPath: string): Database.Database {
   db.exec(TICKLERS_SCHEMA_SQL);
   ensureRecurColumn(db);
   ensureNagColumns(db);
+  ensureNotifyColumn(db);
 
   normalizeStoredDueDates(db);
 
@@ -545,12 +554,13 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
   db.exec(TICKLERS_SCHEMA_SQL);
   ensureRecurColumn(db);
   ensureNagColumns(db);
+  ensureNotifyColumn(db);
 
   const ticklers = Array.isArray(parsed.ticklers) ? parsed.ticklers : [];
 
   const insert = db.prepare(`
-    INSERT OR IGNORE INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur, nag_every, nag_max, last_fired_at, nag_fire_count)
-    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur, @nag_every, @nag_max, @last_fired_at, @nag_fire_count)
+    INSERT OR IGNORE INTO ticklers (id, title, body, due, creator, notify, tags, status, created_at, completed_at, snoozed_until, recur, nag_every, nag_max, last_fired_at, nag_fire_count)
+    VALUES (@id, @title, @body, @due, @creator, @notify, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur, @nag_every, @nag_max, @last_fired_at, @nag_fire_count)
   `);
 
   const migrate = db.transaction((rows: Tickler[]) => {
@@ -577,6 +587,9 @@ export function runMigration(dbOrPath: Database.Database | string, jsonPath: str
         body: t.body ?? null,
         due,
         creator: t.creator ?? null,
+        // Legacy JSON predates notify (tickler-mcp#11) — default it the same way the nag
+        // fields above are defaulted, rather than assuming the field is present.
+        notify: t.notify ?? "agent",
         tags: JSON.stringify(Array.isArray(t.tags) ? t.tags : []),
         status: t.status ?? "pending",
         created_at: t.createdAt ?? new Date().toISOString(),
@@ -630,6 +643,7 @@ function rowToTickler(row: Record<string, unknown>): Tickler {
     body: (row.body as string) ?? "",
     due: row.due as string,
     creator: (row.creator as string) ?? "unknown",
+    notify: ((row.notify as string) ?? "agent") as NotifyChannel,
     tags: row.tags ? (JSON.parse(row.tags as string) as string[]) : [],
     status: row.status as "pending" | "done",
     createdAt: row.created_at as string,
@@ -646,14 +660,15 @@ function rowToTickler(row: Record<string, unknown>): Tickler {
 export function createTickler(tickler: Tickler): void {
   const db = getDb();
   db.prepare(`
-    INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at, completed_at, snoozed_until, recur, nag_every, nag_max, last_fired_at, nag_fire_count)
-    VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur, @nag_every, @nag_max, @last_fired_at, @nag_fire_count)
+    INSERT INTO ticklers (id, title, body, due, creator, notify, tags, status, created_at, completed_at, snoozed_until, recur, nag_every, nag_max, last_fired_at, nag_fire_count)
+    VALUES (@id, @title, @body, @due, @creator, @notify, @tags, @status, @created_at, @completed_at, @snoozed_until, @recur, @nag_every, @nag_max, @last_fired_at, @nag_fire_count)
   `).run({
     id: tickler.id,
     title: tickler.title,
     body: tickler.body ?? null,
     due: normalizeDue(tickler.due),
     creator: tickler.creator ?? null,
+    notify: tickler.notify ?? "agent",
     tags: JSON.stringify(tickler.tags ?? []),
     status: tickler.status,
     created_at: tickler.createdAt,
@@ -709,8 +724,19 @@ export function listTicklers(opts?: { status?: "pending" | "done"; tag?: string 
  * completed, no longer due (e.g. snoozed into the future since `candidate` was read),
  * already exhausted, or already fired by a concurrent claim.
  */
-export function claimNagFire(candidate: Tickler, now: string): Tickler | null {
+export function claimNagFire(
+  candidate: Tickler,
+  now: string,
+  expectedNotify?: NotifyChannel
+): Tickler | null {
   const db = getDb();
+  // expectedNotify is OPTIONAL and defaults to no channel restriction — the existing
+  // agent-facing nag path (checkTicklers) never passed one and must keep claiming
+  // regardless of `notify`. Only claimNotifyFire (tickler-mcp#11) supplies it, so its CAS
+  // claim can never accidentally fire an `agent` tickler it was handed the wrong id for
+  // (round-1 code review finding, both reviewers independently: the read side already
+  // matches `notify` positively in checkNotifyDue/checkTicklers; the write side must too,
+  // or a caller bug quietly consumes another channel's nag budget).
   const result = db
     .prepare(
       `UPDATE ticklers
@@ -719,9 +745,10 @@ export function claimNagFire(candidate: Tickler, now: string): Tickler | null {
          AND status = 'pending'
          AND due <= @now
          AND (nag_max IS NULL OR nag_fire_count < nag_max)
-         AND ((last_fired_at IS NULL AND @oldLastFiredAt IS NULL) OR last_fired_at = @oldLastFiredAt)`
+         AND ((last_fired_at IS NULL AND @oldLastFiredAt IS NULL) OR last_fired_at = @oldLastFiredAt)
+         AND (@expectedNotify IS NULL OR notify = @expectedNotify)`
     )
-    .run({ id: candidate.id, now, oldLastFiredAt: candidate.lastFiredAt });
+    .run({ id: candidate.id, now, oldLastFiredAt: candidate.lastFiredAt, expectedNotify: expectedNotify ?? null });
   if (result.changes === 0) return null;
   return { ...candidate, lastFiredAt: now, nagFireCount: candidate.nagFireCount + 1 };
 }
@@ -745,12 +772,83 @@ function isNagEligible(t: Tickler, now: string): boolean {
 }
 
 /**
+ * Eligibility for the telegram notify-due path (tickler-mcp#11). Different from
+ * `isNagEligible`: a non-nag telegram tickler must fire EXACTLY ONCE (never again once
+ * `lastFiredAt` is set), because nothing re-polls it into an agent's attention the way a
+ * session-based `tickler_check` does. A nag telegram tickler re-fires per its own
+ * `nag.every`/`max`, same rule as `isNagEligible`.
+ */
+function isNotifyEligible(t: Tickler, now: string): boolean {
+  if (t.lastFiredAt === null) return true;
+  if (!t.nag) return false;
+  const everyMs = parseDuration(t.nag.every);
+  if (everyMs === null) return false;
+  const elapsed = Date.parse(now) - Date.parse(t.lastFiredAt);
+  return elapsed >= everyMs;
+}
+
+/**
+ * Read the due `telegram:dave` ticklers for the Telegram poller (tickler-mcp#11) — a pure
+ * read. Same base filter shape as `checkTicklers` (pending / due / not nag-exhausted) with
+ * the channel flipped, plus the `isNotifyEligible` gate applied JS-side the same way
+ * `checkTicklers` applies `isNagEligible`.
+ *
+ * Deliberately does NOT claim anything (`claimNagFire` is never called here): the poller
+ * sends first and marks fired only after the send is confirmed, via `claimNotifyFire`. A read
+ * that marked rows fired would lose a tickler to every failed send — the exact failure this
+ * two-step exists to make impossible. `lastFiredAt` is handed back to the caller as the CAS
+ * token for that claim.
+ */
+export function checkNotifyDue(now: string = new Date().toISOString()): Tickler[] {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT * FROM ticklers
+       WHERE status = 'pending' AND due <= @now AND notify = 'telegram:dave'
+         AND (nag_every IS NULL OR nag_max IS NULL OR nag_fire_count < nag_max)
+       ORDER BY due ASC`
+    )
+    .all({ now }) as Record<string, unknown>[];
+  const candidates = rows.map(rowToTickler);
+  return candidates.filter((t) => isNotifyEligible(t, now));
+}
+
+/**
+ * Claim a notify-due fire for `id`, using `prevLastFiredAt` (the `lastFiredAt` value the
+ * caller read via `checkNotifyDue`, as its own CAS token) as the compare-and-swap
+ * comparison — same mechanism as `claimNagFire`. Returns true if claimed (the tickler is
+ * now marked fired), false if the live row no longer matches (already fired by a
+ * concurrent run, completed, snoozed into the future, or exhausted) — the caller should
+ * treat false as "leave it, it will be retried or was already handled."
+ *
+ * Called from a separate process/invocation (tickler-mcp#11's `notify-mark-fired` CLI
+ * command) that only carries the id + token forward, not the full row — no extra read is
+ * needed first: `claimNagFire`'s own `UPDATE ... WHERE` already re-checks every live column
+ * (status/due/nag_max/nag_fire_count) against the database directly, and a nonexistent id
+ * simply matches zero rows there (refine-pass finding, tickler-mcp#11).
+ *
+ * Passes `expectedNotify: "telegram:dave"` to `claimNagFire` so this can never claim (and
+ * thereby consume the nag budget of) an `agent`-channel tickler, even if a caller supplies
+ * the wrong id — the read side (`checkNotifyDue`) already matches `notify` positively, and
+ * the write side must too (round-1 code review, both reviewers independently).
+ */
+export function claimNotifyFire(id: string, prevLastFiredAt: string | null, now: string): boolean {
+  const candidate = { id, lastFiredAt: prevLastFiredAt, nagFireCount: 0 } as Tickler;
+  const claimed = claimNagFire(candidate, now, "telegram:dave");
+  return claimed !== null;
+}
+
+/**
  * Return past-due pending ticklers. By default (`markFired: true`) a due nag tickler's fire
  * is claimed atomically — `lastFiredAt`/`nagFireCount` advance and it will not be returned
  * again until `every` elapses (or ever again, once `max` fires are reached — issue #10).
  * Pass `markFired: false` for a dry read (what `tickler_list` structurally already gets, and
  * what `tickler_check --no-mark-fired` / `mark_fired:false` opts into explicitly) that never
  * advances the nag clock.
+ *
+ * Agent-delivered only: the WHERE matches `notify = 'agent'` positively (tickler-mcp#11), so
+ * a `telegram:dave` tickler is invisible here and a future third channel cannot leak into an
+ * agent's attention by mere omission. The telegram path is `checkNotifyDue`.
  */
 export function checkTicklers(markFired: boolean = true): Tickler[] {
   const db = getDb();
@@ -761,7 +859,7 @@ export function checkTicklers(markFired: boolean = true): Tickler[] {
   const rows = db
     .prepare(
       `SELECT * FROM ticklers
-       WHERE status = 'pending' AND due <= @now
+       WHERE status = 'pending' AND due <= @now AND notify = 'agent'
          AND (nag_every IS NULL OR nag_max IS NULL OR nag_fire_count < nag_max)
        ORDER BY due ASC`
     )
@@ -828,6 +926,9 @@ export function completeTickler(id: string): CompleteResult {
       due: nextDue,
       tags: existing.tags,
       creator: existing.creator,
+      // The delivery channel persists to the successor, same as the nag rule below —
+      // a recurring telegram reminder does not fall back to agent delivery mid-series.
+      notify: existing.notify,
       status: "pending",
       createdAt: now,
       completedAt: null,

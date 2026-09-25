@@ -137,3 +137,137 @@ describe("cli: --recur parsing (codex round-4 code review, issue #9)", () => {
     assert.ok(threw, 'daily:2 must be rejected — the CLI does not support an interval suffix on "daily"');
   });
 });
+
+describe("cli: notify channel (tickler-mcp#11)", () => {
+  /** Same spawn shape as `cli` above, but keeps stdout/exit status on a nonzero exit —
+   * `check --notify-due` and `notify-mark-fired` encode their outcome in the exit code. */
+  function cliRun(args: string): { status: number; stdout: string; stderr: string } {
+    try {
+      const stdout = execSync(`node "${CLI}" ${args}`, {
+        env: { ...process.env, TICKLER_DB_PATH: TEST_DB },
+        encoding: "utf-8",
+      });
+      return { status: 0, stdout, stderr: "" };
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & { status?: number; stdout?: string; stderr?: string };
+      return { status: e.status ?? 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    }
+  }
+
+  /** Create a telegram:dave tickler and return its id, read from `check --notify-due`'s JSON. */
+  function createDueTelegram(title: string): string {
+    const due = new Date(Date.now() - 3600_000).toISOString();
+    cli(`create "${title}" --due "${due}" --notify telegram:dave --body "telegram body"`);
+    const r = cliRun("check --notify-due");
+    assert.equal(r.status, 1, "a due telegram tickler must make check --notify-due exit 1");
+    const found = (JSON.parse(r.stdout) as { id: string; title: string }[]).find((x) => x.title === title);
+    assert.ok(found, `the created "${title}" must appear in check --notify-due output`);
+    return found!.id;
+  }
+
+  test('create --notify telegram:dave is echoed back and listed', () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    const out = cli(`create "notify CLI telegram" --due "${due}" --notify telegram:dave`);
+    assert.match(out, /Created:/);
+    assert.match(out, /Notify:\s+telegram:dave/, "the channel must be echoed back, as recur/nag are");
+    assert.match(cli("list"), /notify CLI telegram/);
+  });
+
+  test("create without --notify prints no Notify line (the default is silent)", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    const out = cli(`create "notify CLI default" --due "${due}"`);
+    assert.match(out, /Created:/);
+    assert.ok(!/Notify:/.test(out), "the default channel is not worth a line of output");
+  });
+
+  test("create --notify bogus is rejected with the channel error", () => {
+    const due = new Date(Date.now() + 86400000).toISOString();
+    const r = cliRun(`create "notify CLI bogus" --due "${due}" --notify bogus`);
+    assert.notEqual(r.status, 0, "an unknown channel must exit nonzero");
+    assert.match(r.stderr, /--notify must be "agent" or "telegram:dave"/);
+  });
+
+  test("check --notify-due with none due exits 0 and prints []", () => {
+    // Only future-due rows exist at this point in the file, and none of them telegram.
+    const r = cliRun("check --notify-due");
+    assert.equal(r.status, 0);
+    assert.deepEqual(JSON.parse(r.stdout), []);
+  });
+
+  test("check --notify-due with a due telegram tickler exits 1 and prints its JSON", () => {
+    const id = createDueTelegram("notify CLI due");
+
+    const r = cliRun("check --notify-due");
+    assert.equal(r.status, 1, "1 = found something, same convention as the agent check");
+    const rows = JSON.parse(r.stdout) as { id: string; title: string; body: string; due: string; lastFiredAt: string | null }[];
+    const found = rows.find((x) => x.id === id);
+    assert.ok(found, "the due telegram tickler must be in the JSON output");
+    assert.equal(found.title, "notify CLI due");
+    assert.equal(found.body, "telegram body");
+    assert.ok(found.due, "the poller needs the due timestamp to render the message");
+    assert.equal(found.lastFiredAt, null, "the read is dry — the token is handed over unspent");
+
+    // And the read must not have marked it fired: a second identical read says the same thing.
+    const again = cliRun("check --notify-due");
+    assert.equal(again.status, 1);
+    assert.equal((JSON.parse(again.stdout) as { id: string }[]).some((x) => x.id === id), true);
+  });
+
+  test("check --notify-due never surfaces a due agent tickler", () => {
+    const due = new Date(Date.now() - 3600_000).toISOString();
+    cli(`create "notify CLI agent due" --due "${due}"`);
+    const r = cliRun("check --notify-due");
+    const titles = (JSON.parse(r.stdout) as { title: string }[]).map((x) => x.title);
+    assert.ok(!titles.includes("notify CLI agent due"), "the agent channel is not the telegram poller's business");
+  });
+
+  test("notify-mark-fired claims once; the same stale token loses the race", () => {
+    const id = createDueTelegram("notify CLI claim");
+
+    const first = cliRun(`notify-mark-fired ${id} --prev-fired-at none`);
+    assert.equal(first.status, 0, "exit 0 = claimed");
+    assert.match(first.stdout, /Claimed:/);
+
+    // Same token as before — the live row's lastFiredAt has moved on, so this is the
+    // lost-race path a second poller run (or a retry after a slow send) must survive.
+    const second = cliRun(`notify-mark-fired ${id} --prev-fired-at none`);
+    assert.equal(second.status, 1, "exit 1 = lost race / no longer eligible");
+    assert.match(second.stderr, /Not claimed/);
+
+    // Claimed exactly once, so the poller will not be told about it again.
+    const r = cliRun("check --notify-due");
+    assert.ok(
+      !(JSON.parse(r.stdout) as { id: string }[]).some((x) => x.id === id),
+      "a claimed non-nag telegram tickler must not be returned again"
+    );
+  });
+
+  test("notify-mark-fired on a nonexistent id exits 1", () => {
+    const r = cliRun("notify-mark-fired nonexistent-id --prev-fired-at none");
+    assert.equal(r.status, 1);
+  });
+
+  test("notify-mark-fired without --prev-fired-at exits nonzero (usage error)", () => {
+    const r = cliRun("notify-mark-fired some-id");
+    assert.notEqual(r.status, 0, "the token is required, not optional");
+  });
+
+  test("notify-mark-fired accepts \"null\" and \"\" as the null token, not just \"none\"", () => {
+    // Round-1 code review finding (BLOCKING, both reviewers independently): a JSON `null`
+    // read via `jq -r '.[].lastFiredAt'` prints the literal text "null", not "none" — the
+    // obvious shell pipeline would otherwise pass a token that matches no row, silently
+    // losing the claim on every poll (exit 1, indistinguishable from a real lost race).
+    const idNull = createDueTelegram("notify CLI null-token");
+    const rNull = cliRun(`notify-mark-fired ${idNull} --prev-fired-at null`);
+    assert.equal(rNull.status, 0, '"null" must be accepted as the null token');
+
+    const idEmpty = createDueTelegram("notify CLI empty-token");
+    const rEmpty = cliRun(`notify-mark-fired ${idEmpty} --prev-fired-at ""`);
+    assert.equal(rEmpty.status, 0, 'an empty string must be accepted as the null token');
+  });
+
+  // Cleanup after these tests' rows — the file's earlier cleanup test ran before this block.
+  test("cleanup", () => {
+    cleanup();
+  });
+});
