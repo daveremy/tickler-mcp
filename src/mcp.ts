@@ -49,7 +49,7 @@ const nagSchema = z
     "Optional nag rule. Once due, `tickler_check` keeps returning this tickler every `every` " +
       "until `tickler_complete` or `max` fires are reached (flagged nag-exhausted on the final " +
       "fire, still pending). Nag cadences shorter than 1 day only fire once per the daily " +
-      "morning tickler_check route until a due-time poller (tickler-mcp#11) lands."
+      "morning tickler_check route — the tickler-mcp#11 due-time poller only covers the `telegram:dave` channel, not `agent`."
   );
 
 const server = new McpServer({ name: "tickler-mcp", version: VERSION });
@@ -161,7 +161,7 @@ server.tool(
   "tickler_check",
   "Return only past-due pending ticklers (due <= now). Designed for cron polling — call this at the start of each review session. " +
     "A due nag tickler is returned again on later calls once its `every` interval elapses, until completed or exhausted. " +
-    "Nag cadences shorter than 1 day only fire once per the daily morning route until a due-time poller (tickler-mcp#11) lands.",
+    "Nag cadences shorter than 1 day only fire once per the daily morning route — the tickler-mcp#11 due-time poller only covers the `telegram:dave` channel, not `agent`.",
   {
     mark_fired: z.boolean().optional().describe(
       "Default true. Set false for a dry read that does not advance nag state (lastFiredAt/fire count) — use tickler_list for that instead when possible."
