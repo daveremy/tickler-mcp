@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-09-25
+
 ### Added
 - **Telegram delivery: `notify` field + `--notify-due` / `notify-mark-fired`**
   ([#11](https://github.com/daveremy/tickler-mcp/issues/11)). `tickler_create` / `tickler

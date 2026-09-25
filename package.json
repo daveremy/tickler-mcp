@@ -1,6 +1,6 @@
 {
   "name": "tickler-mcp",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Persistent tickler/reminder MCP server for Claude Code and any MCP client",
   "type": "module",
   "license": "MIT",
