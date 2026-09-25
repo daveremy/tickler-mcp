@@ -252,6 +252,20 @@ describe("cli: notify channel (tickler-mcp#11)", () => {
     assert.notEqual(r.status, 0, "the token is required, not optional");
   });
 
+  test("notify-mark-fired accepts \"null\" and \"\" as the null token, not just \"none\"", () => {
+    // Round-1 code review finding (BLOCKING, both reviewers independently): a JSON `null`
+    // read via `jq -r '.[].lastFiredAt'` prints the literal text "null", not "none" — the
+    // obvious shell pipeline would otherwise pass a token that matches no row, silently
+    // losing the claim on every poll (exit 1, indistinguishable from a real lost race).
+    const idNull = createDueTelegram("notify CLI null-token");
+    const rNull = cliRun(`notify-mark-fired ${idNull} --prev-fired-at null`);
+    assert.equal(rNull.status, 0, '"null" must be accepted as the null token');
+
+    const idEmpty = createDueTelegram("notify CLI empty-token");
+    const rEmpty = cliRun(`notify-mark-fired ${idEmpty} --prev-fired-at ""`);
+    assert.equal(rEmpty.status, 0, 'an empty string must be accepted as the null token');
+  });
+
   // Cleanup after these tests' rows — the file's earlier cleanup test ran before this block.
   test("cleanup", () => {
     cleanup();

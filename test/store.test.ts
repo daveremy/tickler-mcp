@@ -1358,6 +1358,25 @@ describe("store: notify channel (tickler-mcp#11)", () => {
     assert.equal(claimNotifyFire("nonexistent-id", null, new Date().toISOString()), false);
   });
 
+  test("claimNotifyFire never fires an agent-channel tickler, even with a matching token", () => {
+    // Round-1 code review finding (both reviewers independently): claimNotifyFire reused
+    // claimNagFire's UPDATE with no channel restriction, so calling it against an `agent`
+    // tickler's id would silently succeed and consume that tickler's nag budget / hide its
+    // next agent-facing fire. The token passed here (null) genuinely matches the fresh
+    // agent tickler's live lastFiredAt, so this only proves anything if the channel guard
+    // — not the token compare — is what blocks the claim.
+    const t = makeTickler({ title: "notify-agent-must-not-be-claimable", due: pastDue(), notify: "agent" });
+    createTickler(t);
+    assert.equal(
+      claimNotifyFire(t.id, null, new Date().toISOString()),
+      false,
+      "claimNotifyFire must refuse to claim an agent-channel tickler"
+    );
+    const persisted = getTickler(t.id)!;
+    assert.equal(persisted.lastFiredAt, null, "an agent tickler's fire state must be untouched");
+    assert.equal(persisted.nagFireCount, 0);
+  });
+
   test("every row checkNotifyDue returns is claimable by its own lastFiredAt token", () => {
     // The round-2 plan-review requirement: the read filter and the claim filter must never
     // disagree. Seeds a mix so the read has to actually choose — only some rows belong.

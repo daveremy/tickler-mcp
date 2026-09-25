@@ -724,8 +724,19 @@ export function listTicklers(opts?: { status?: "pending" | "done"; tag?: string 
  * completed, no longer due (e.g. snoozed into the future since `candidate` was read),
  * already exhausted, or already fired by a concurrent claim.
  */
-export function claimNagFire(candidate: Tickler, now: string): Tickler | null {
+export function claimNagFire(
+  candidate: Tickler,
+  now: string,
+  expectedNotify?: NotifyChannel
+): Tickler | null {
   const db = getDb();
+  // expectedNotify is OPTIONAL and defaults to no channel restriction — the existing
+  // agent-facing nag path (checkTicklers) never passed one and must keep claiming
+  // regardless of `notify`. Only claimNotifyFire (tickler-mcp#11) supplies it, so its CAS
+  // claim can never accidentally fire an `agent` tickler it was handed the wrong id for
+  // (round-1 code review finding, both reviewers independently: the read side already
+  // matches `notify` positively in checkNotifyDue/checkTicklers; the write side must too,
+  // or a caller bug quietly consumes another channel's nag budget).
   const result = db
     .prepare(
       `UPDATE ticklers
@@ -734,9 +745,10 @@ export function claimNagFire(candidate: Tickler, now: string): Tickler | null {
          AND status = 'pending'
          AND due <= @now
          AND (nag_max IS NULL OR nag_fire_count < nag_max)
-         AND ((last_fired_at IS NULL AND @oldLastFiredAt IS NULL) OR last_fired_at = @oldLastFiredAt)`
+         AND ((last_fired_at IS NULL AND @oldLastFiredAt IS NULL) OR last_fired_at = @oldLastFiredAt)
+         AND (@expectedNotify IS NULL OR notify = @expectedNotify)`
     )
-    .run({ id: candidate.id, now, oldLastFiredAt: candidate.lastFiredAt });
+    .run({ id: candidate.id, now, oldLastFiredAt: candidate.lastFiredAt, expectedNotify: expectedNotify ?? null });
   if (result.changes === 0) return null;
   return { ...candidate, lastFiredAt: now, nagFireCount: candidate.nagFireCount + 1 };
 }
@@ -814,10 +826,15 @@ export function checkNotifyDue(now: string = new Date().toISOString()): Tickler[
  * needed first: `claimNagFire`'s own `UPDATE ... WHERE` already re-checks every live column
  * (status/due/nag_max/nag_fire_count) against the database directly, and a nonexistent id
  * simply matches zero rows there (refine-pass finding, tickler-mcp#11).
+ *
+ * Passes `expectedNotify: "telegram:dave"` to `claimNagFire` so this can never claim (and
+ * thereby consume the nag budget of) an `agent`-channel tickler, even if a caller supplies
+ * the wrong id — the read side (`checkNotifyDue`) already matches `notify` positively, and
+ * the write side must too (round-1 code review, both reviewers independently).
  */
 export function claimNotifyFire(id: string, prevLastFiredAt: string | null, now: string): boolean {
   const candidate = { id, lastFiredAt: prevLastFiredAt, nagFireCount: 0 } as Tickler;
-  const claimed = claimNagFire(candidate, now);
+  const claimed = claimNagFire(candidate, now, "telegram:dave");
   return claimed !== null;
 }
 

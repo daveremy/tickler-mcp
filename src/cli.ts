@@ -93,11 +93,19 @@ program
     // Full alternative branch, checked first: the Telegram poller's read must never touch
     // the agent path's mark-fired logic (or anything else in this action).
     if (opts.notifyDue) {
-      const due = checkNotifyDue();
-      // Read-only on purpose — the poller sends first, then claims via notify-mark-fired,
-      // so a failed send leaves the tickler due rather than losing it.
-      console.log(JSON.stringify(due.map(t => ({ id: t.id, title: t.title, body: t.body, due: t.due, lastFiredAt: t.lastFiredAt })), null, 2));
-      process.exit(due.length > 0 ? 1 : 0);
+      // Wrapped so a DB/open error exits 2, distinct from exit 1's "items are due" — a
+      // poller reading only the exit code must be able to tell "crashed" from "nothing
+      // urgent" (round-1 code review finding: both shared exit 1 before this fix).
+      try {
+        const due = checkNotifyDue();
+        // Read-only on purpose — the poller sends first, then claims via notify-mark-fired,
+        // so a failed send leaves the tickler due rather than losing it.
+        console.log(JSON.stringify(due.map(t => ({ id: t.id, title: t.title, body: t.body, due: t.due, lastFiredAt: t.lastFiredAt })), null, 2));
+        process.exit(due.length > 0 ? 1 : 0);
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exit(2);
+      }
     }
 
     const overdue = checkTicklers(opts.markFired);
@@ -114,9 +122,17 @@ program
 program
   .command("notify-mark-fired <id>")
   .description("Claim a notify-due fire for <id> after a confirmed send (tickler-mcp#11). Exit 0 = claimed, 1 = lost race/no longer eligible, 2 = usage/DB error.")
-  .requiredOption("--prev-fired-at <value>", 'The lastFiredAt token from `check --notify-due` JSON output — pass the literal string "none" if it was null')
+  .requiredOption("--prev-fired-at <value>", 'The lastFiredAt token from `check --notify-due` JSON output — pass "none" (or "null", or an empty string) if it was null')
   .action((id: string, opts: { prevFiredAt: string }) => {
-    const prev = opts.prevFiredAt === "none" ? null : opts.prevFiredAt;
+    // Accept "none", "null" and "" as the null token, not just the literal "none" the
+    // description asks for — `jq -r '.[].lastFiredAt'` on a JSON `null` prints the text
+    // "null", not "none", so the obvious shell pipeline a caller reaches for would
+    // otherwise silently pass a wrong token through as a literal string compare that
+    // matches no row (round-1 code review finding, BLOCKING: this previously caused an
+    // eligible tickler to read exit 1 "lost race", the same code path as a real lost
+    // race, and never get marked fired — a false-pass that resent the tickler forever).
+    const NULL_TOKENS = new Set(["none", "null", ""]);
+    const prev = NULL_TOKENS.has(opts.prevFiredAt) ? null : opts.prevFiredAt;
     try {
       const claimed = claimNotifyFire(id, prev, new Date().toISOString());
       if (claimed) {
