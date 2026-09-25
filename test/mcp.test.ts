@@ -66,6 +66,33 @@ describe("mcp handler: tickler_create", () => {
   });
 });
 
+describe("mcp handler: tickler_create notify channel (tickler-mcp#11)", () => {
+  test("notify: telegram:dave round-trips and stays out of the agent check path", () => {
+    // Same construction the handler performs: `notify: notify ?? "agent"` into createTickler.
+    const t = makeTickler({
+      title: "mcp-notify-telegram",
+      due: new Date(Date.now() - 3600_000).toISOString(),
+      notify: "telegram:dave",
+    });
+    createTickler(t);
+
+    const found = getTickler(t.id);
+    assert.ok(found);
+    assert.equal(found!.notify, "telegram:dave", "the channel must survive the store round trip");
+    assert.ok(
+      !checkTicklers().some((x) => x.id === t.id),
+      "tickler_check must not surface a telegram:dave tickler"
+    );
+  });
+
+  test("notify omitted defaults to agent", () => {
+    const t = makeTickler({ title: "mcp-notify-default" });
+    assert.equal(t.notify, undefined, "fixture must actually omit notify, or this proves nothing");
+    createTickler(t);
+    assert.equal(getTickler(t.id)!.notify, "agent");
+  });
+});
+
 describe("mcp handler: tickler_list", () => {
   test("returns all ticklers sorted by due", () => {
     const now = Date.now();

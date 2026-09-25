@@ -27,6 +27,8 @@ import {
   createTickler,
   listTicklers,
   checkTicklers,
+  checkNotifyDue,
+  claimNotifyFire,
   completeTickler,
   deleteTickler,
   snoozeTickler,
@@ -38,6 +40,7 @@ import {
   TICKLERS_SCHEMA_SQL,
   ensureRecurColumn,
   ensureColumn,
+  ensureNotifyColumn,
   formatTickler,
 } from "../src/store.js";
 import { resolveRecurForCreate, getWallTime } from "../src/recur.js";
@@ -1254,5 +1257,238 @@ describe("store: recur column migration (issue #9)", () => {
 
     db.close();
     rmDb(dbPath);
+  });
+});
+
+describe("store: notify channel (tickler-mcp#11)", () => {
+  /** An already-due timestamp, 1h in the past. */
+  const pastDue = () => new Date(Date.now() - 3600_000).toISOString();
+
+  test("createTickler with no notify given defaults to agent", () => {
+    const t = makeTickler({ title: "notify-default", due: pastDue() });
+    assert.equal(t.notify, undefined, "fixture must actually omit notify, or this proves nothing");
+    createTickler(t);
+    assert.equal(getTickler(t.id)!.notify, "agent");
+  });
+
+  test("checkTicklers (the agent path) does not return a due telegram:dave tickler", () => {
+    const t = makeTickler({ title: "notify-tg-hidden-from-agent", due: pastDue(), notify: "telegram:dave" });
+    createTickler(t);
+    const due = checkTicklers();
+    assert.ok(!due.some((x) => x.id === t.id), "a telegram tickler must never surface in an agent session's check");
+    // The agent path must not have claimed it either — it was never its row to claim.
+    assert.equal(getTickler(t.id)!.lastFiredAt, null);
+    assert.equal(getTickler(t.id)!.nagFireCount, 0);
+  });
+
+  test("checkNotifyDue returns a due telegram:dave tickler WITHOUT mutating lastFiredAt", () => {
+    // A nag row, so a mutating implementation (one that claimed inline, checkTicklers-style)
+    // would visibly advance lastFiredAt/nagFireCount here.
+    const t = makeTickler({ title: "notify-tg-read-only", due: pastDue(), notify: "telegram:dave", nag: { every: "1h" } });
+    createTickler(t);
+
+    const due = checkNotifyDue();
+    const found = due.find((x) => x.id === t.id);
+    assert.ok(found, "a due telegram tickler must be returned to the poller");
+    assert.equal(found!.lastFiredAt, null, "the read hands back the CAS token, it does not spend it");
+
+    const persisted = getTickler(t.id)!;
+    assert.equal(persisted.lastFiredAt, null, "checkNotifyDue must be a pure read — no fire recorded");
+    assert.equal(persisted.nagFireCount, 0);
+  });
+
+  test("checkNotifyDue does not return a due agent tickler", () => {
+    const t = makeTickler({ title: "notify-agent-not-in-telegram-path", due: pastDue(), notify: "agent" });
+    createTickler(t);
+    assert.ok(!checkNotifyDue().some((x) => x.id === t.id));
+  });
+
+  test("a non-nag telegram tickler fires exactly once: claim, then never again", () => {
+    const t = makeTickler({ title: "notify-tg-fire-once", due: pastDue(), notify: "telegram:dave" });
+    createTickler(t);
+
+    assert.ok(checkNotifyDue().some((x) => x.id === t.id), "must be returned before its confirmed send");
+    assert.equal(claimNotifyFire(t.id, null, new Date().toISOString()), true, "the first claim must win");
+
+    const second = checkNotifyDue(new Date(Date.now() + 3600_000).toISOString());
+    assert.ok(
+      !second.some((x) => x.id === t.id),
+      "a non-nag telegram tickler must never be returned again — not even an hour later, since nothing re-polls it into an agent's attention"
+    );
+    assert.equal(getTickler(t.id)!.nagFireCount, 1, "exactly one fire recorded");
+  });
+
+  test("a nag telegram tickler re-fires once nag.every has elapsed since the claim", () => {
+    const t = makeTickler({ title: "notify-tg-nag-refire", due: pastDue(), notify: "telegram:dave", nag: { every: "1h", max: 3 } });
+    createTickler(t);
+
+    const firedAt = new Date().toISOString();
+    assert.equal(claimNotifyFire(t.id, null, firedAt), true);
+    assert.ok(
+      !checkNotifyDue().some((x) => x.id === t.id),
+      "must not be returned again before the nag interval elapses"
+    );
+
+    // Fast-forward the clock rather than the row — checkNotifyDue takes `now` explicitly, so
+    // no raw UPDATE is needed (the recur tests' past-anchor trick, on the reading side).
+    const later = new Date(Date.parse(firedAt) + 2 * 3600_000).toISOString();
+    const refired = checkNotifyDue(later);
+    const found = refired.find((x) => x.id === t.id);
+    assert.ok(found, "must re-fire once every has elapsed since the last claim");
+    assert.equal(found!.lastFiredAt, firedAt, "the re-read still carries the token the next claim must present");
+  });
+
+  test("claimNotifyFire loses the race when presented with a stale token", () => {
+    const t = makeTickler({ title: "notify-tg-stale-token", due: pastDue(), notify: "telegram:dave", nag: { every: "1h" } });
+    createTickler(t);
+
+    // A concurrent poller claims first — the live row's lastFiredAt moves on…
+    assert.equal(claimNotifyFire(t.id, null, new Date().toISOString()), true);
+    // …but this caller's token still says "never fired". Same construction as the
+    // claimNagFire double-claim test in nag.test.ts.
+    assert.equal(
+      claimNotifyFire(t.id, null, new Date().toISOString()),
+      false,
+      "a stale token must not win a second fire"
+    );
+    assert.equal(getTickler(t.id)!.nagFireCount, 1, "exactly one fire must be recorded — no double-send");
+  });
+
+  test("claimNotifyFire returns false for a nonexistent id", () => {
+    assert.equal(claimNotifyFire("nonexistent-id", null, new Date().toISOString()), false);
+  });
+
+  test("every row checkNotifyDue returns is claimable by its own lastFiredAt token", () => {
+    // The round-2 plan-review requirement: the read filter and the claim filter must never
+    // disagree. Seeds a mix so the read has to actually choose — only some rows belong.
+    const prefix = crypto.randomUUID().slice(0, 8);
+    const twoHoursAgo = new Date(Date.now() - 2 * 3600_000).toISOString();
+    const rows: Tickler[] = [
+      makeTickler({ id: `${prefix}-plain`, title: "notify-agree-plain", due: pastDue(), notify: "telegram:dave" }),
+      makeTickler({ id: `${prefix}-nag-fresh`, title: "notify-agree-nag-fresh", due: pastDue(), notify: "telegram:dave", nag: { every: "1h", max: 5 } }),
+      makeTickler({ id: `${prefix}-nag-elapsed`, title: "notify-agree-nag-elapsed", due: pastDue(), notify: "telegram:dave", nag: { every: "1h", max: 5 }, lastFiredAt: twoHoursAgo, nagFireCount: 1 }),
+      makeTickler({ id: `${prefix}-nag-exhausted`, title: "notify-agree-exhausted", due: pastDue(), notify: "telegram:dave", nag: { every: "1h", max: 1 }, lastFiredAt: twoHoursAgo, nagFireCount: 1 }),
+      makeTickler({ id: `${prefix}-agent`, title: "notify-agree-agent", due: pastDue(), notify: "agent" }),
+      makeTickler({ id: `${prefix}-future`, title: "notify-agree-future", due: new Date(Date.now() + 86400_000).toISOString(), notify: "telegram:dave" }),
+    ];
+    rows.forEach(createTickler);
+
+    const due = checkNotifyDue().filter((x) => x.id.startsWith(prefix));
+    assert.deepEqual(
+      due.map((x) => x.id).sort(),
+      [`${prefix}-nag-elapsed`, `${prefix}-nag-fresh`, `${prefix}-plain`].sort(),
+      "exactly the due, unexhausted telegram rows — not the agent row, the future row, or the exhausted one"
+    );
+
+    const now = new Date().toISOString();
+    for (const row of due) {
+      assert.equal(
+        claimNotifyFire(row.id, row.lastFiredAt, now),
+        true,
+        `the row checkNotifyDue just returned (${row.id}) must be claimable by its own token — the read and claim filters disagree`
+      );
+    }
+  });
+
+  test("ensureNotifyColumn backfills a pre-#11 schema, and old rows read back as agent", () => {
+    const dbPath = tmpDbPath("migration-notify");
+    // Pre-#11 schema: has recur and the nag columns, but no notify.
+    const oldSchema = `
+      CREATE TABLE IF NOT EXISTS ticklers (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        body TEXT,
+        due TEXT NOT NULL,
+        creator TEXT,
+        tags TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        completed_at TEXT,
+        snoozed_until TEXT,
+        recur TEXT,
+        nag_every TEXT,
+        nag_max INTEGER,
+        last_fired_at TEXT,
+        nag_fire_count INTEGER NOT NULL DEFAULT 0
+      )
+    `;
+    const db = new Database(dbPath);
+    db.exec(oldSchema);
+    db.prepare(
+      "INSERT INTO ticklers (id, title, body, due, creator, tags, status, created_at) VALUES (@id, @title, @body, @due, @creator, @tags, @status, @created_at)"
+    ).run({
+      id: "pre-notify-row",
+      title: "pre-existing tickler",
+      body: "",
+      due: new Date().toISOString(),
+      creator: "test",
+      tags: "[]",
+      status: "pending",
+      created_at: new Date().toISOString(),
+    });
+
+    const columnsBefore = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(!columnsBefore.some((c) => c.name === "notify"), "old schema must not already have notify");
+
+    ensureNotifyColumn(db);
+    const columnsAfter = db.prepare("PRAGMA table_info(ticklers)").all() as { name: string }[];
+    assert.ok(columnsAfter.some((c) => c.name === "notify"), "notify column must exist after migration");
+
+    const row = db.prepare("SELECT * FROM ticklers WHERE id = @id").get({ id: "pre-notify-row" }) as Record<string, unknown>;
+    assert.equal(row.notify, "agent", "DEFAULT 'agent' must apply to a backfilled column on an existing row");
+
+    assert.doesNotThrow(() => ensureNotifyColumn(db), "must be idempotent on an already-migrated DB");
+
+    db.close();
+    rmDb(dbPath);
+  });
+
+  test("runMigration's legacy-JSON import path defaults a missing notify to agent", () => {
+    const dbPath = tmpDbPath("import-notify");
+    const jsonPath = path.join(os.tmpdir(), `ticklers-legacy-notify-${crypto.randomUUID()}.json`);
+    const legacy = {
+      id: crypto.randomUUID(),
+      title: "legacy no-notify row",
+      body: "",
+      due: new Date(Date.now() + 86400_000).toISOString(),
+      tags: [],
+      creator: "test",
+      status: "pending" as const,
+      createdAt: new Date().toISOString(),
+      completedAt: null,
+      recur: null,
+      // Deliberately omits notify — a genuinely pre-#11 legacy row.
+    };
+    fs.writeFileSync(jsonPath, JSON.stringify({ ticklers: [legacy] }));
+
+    runMigration(dbPath, jsonPath);
+
+    const db = new Database(dbPath);
+    const row = db.prepare("SELECT notify FROM ticklers WHERE id = ?").get(legacy.id) as { notify: string };
+    assert.equal(row.notify, "agent");
+    db.close();
+
+    rmDb(dbPath);
+    try { fs.unlinkSync(jsonPath + ".migrated"); } catch { /* ignore */ }
+  });
+
+  test("a recurring telegram tickler's successor keeps the channel", () => {
+    // The channel is a property of the reminder, not the occurrence — a weekly telegram
+    // reminder must not fall back to agent delivery mid-series.
+    const created = resolveRecurForCreate(
+      { freq: "daily", tz: "America/Phoenix" },
+      new Date(Date.now() - 3600_000).toISOString()
+    );
+    const t = makeTickler({
+      title: "notify-recur-successor",
+      recur: created.recur,
+      due: created.due,
+      notify: "telegram:dave",
+    });
+    createTickler(t);
+
+    const result = completeTickler(t.id);
+    assert.ok(result.nextId, "a recurring tickler must schedule a successor");
+    assert.equal(getTickler(result.nextId!)!.notify, "telegram:dave");
   });
 });

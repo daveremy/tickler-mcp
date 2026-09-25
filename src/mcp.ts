@@ -67,10 +67,14 @@ server.tool(
     ),
     tags: z.array(z.string()).optional().describe("Optional tags for filtering (e.g. [\"eng\", \"clubexpress\"])"),
     creator: z.string().optional().describe("Agent or user creating this tickler (e.g. karpathy, marcus)"),
+    notify: z.enum(["agent", "telegram:dave"]).optional().describe(
+      "Notification channel: \"agent\" (default) — today's behavior, agent session polls tickler_check. " +
+        "\"telegram:dave\" — delivered via a Telegram poller job instead (tickler-mcp#11); not surfaced by tickler_check."
+    ),
     recur: recurSchema,
     nag: nagSchema,
   },
-  async ({ title, body, due: dueInput, tags = [], creator = "unknown", recur, nag }) => {
+  async ({ title, body, due: dueInput, tags = [], creator = "unknown", notify, recur, nag }) => {
     // Normalize up front so the value echoed back is the value stored.
     let due: string;
     try {
@@ -113,6 +117,7 @@ server.tool(
       due,
       tags,
       creator,
+      notify: notify ?? "agent",
       status: "pending",
       createdAt: new Date().toISOString(),
       completedAt: null,
