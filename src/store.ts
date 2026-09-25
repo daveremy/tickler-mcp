@@ -809,14 +809,15 @@ export function checkNotifyDue(now: string = new Date().toISOString()): Tickler[
  * concurrent run, completed, snoozed into the future, or exhausted) — the caller should
  * treat false as "leave it, it will be retried or was already handled."
  *
- * Reads the live row fresh (rather than trusting a caller-supplied full Tickler) because
- * this is called from a separate process/invocation (tickler-mcp#11's `notify-mark-fired`
- * CLI command) that only carries the id + token forward, not the full row.
+ * Called from a separate process/invocation (tickler-mcp#11's `notify-mark-fired` CLI
+ * command) that only carries the id + token forward, not the full row — no extra read is
+ * needed first: `claimNagFire`'s own `UPDATE ... WHERE` already re-checks every live column
+ * (status/due/nag_max/nag_fire_count) against the database directly, and a nonexistent id
+ * simply matches zero rows there (refine-pass finding, tickler-mcp#11).
  */
 export function claimNotifyFire(id: string, prevLastFiredAt: string | null, now: string): boolean {
-  const existing = getTickler(id);
-  if (!existing) return false;
-  const claimed = claimNagFire({ ...existing, lastFiredAt: prevLastFiredAt }, now);
+  const candidate = { id, lastFiredAt: prevLastFiredAt, nagFireCount: 0 } as Tickler;
+  const claimed = claimNagFire(candidate, now);
   return claimed !== null;
 }
 
