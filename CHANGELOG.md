@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-11-16
+
+### Fixed
+- A recurring `telegram:dave` tickler rolls to its next occurrence when `notify-mark-fired` claims it, so "every Friday" reminds every Friday instead of once (daveremy/lifeos#4165). Nag and one-off ticklers are unchanged.
+
 ## [1.3.0] - 2026-09-25
 
 ### Added
