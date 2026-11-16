@@ -1409,6 +1409,28 @@ describe("store: notify channel (tickler-mcp#11)", () => {
     }
   });
 
+  test("a weekly telegram tickler is eligible and claimed on two consecutive due times with no agent action (lifeos#4165)", () => {
+    const c = resolveRecurForCreate({ freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" }, "2026-09-13T14:00:00.000Z");
+    createTickler(makeTickler({ title: "notify-weekly-roll", due: c.due, recur: c.recur, notify: "telegram:dave" }));
+    let due = c.due;
+    for (const week of [1, 2]) {
+      const row = checkNotifyDue(due).find((x) => x.title === "notify-weekly-roll" && x.due === due);
+      assert.ok(row, `week ${week}: the occurrence must be eligible at its own due time`);
+      assert.equal(claimNotifyFire(row!.id, row!.lastFiredAt, due), true);
+      due = listTicklers({ status: "pending" }).find((x) => x.title === "notify-weekly-roll")!.due;
+    }
+    assert.equal(due, "2026-09-27T14:00:00.000Z");
+  });
+
+  test("claimNotifyFire does not roll a one-off or a nag tickler", () => {
+    const c = resolveRecurForCreate({ freq: "weekly", byWeekday: ["SU"], tz: "America/Phoenix" }, "2026-09-13T14:00:00.000Z");
+    const oneOff = makeTickler({ title: "notify-no-roll-oneoff", due: c.due, notify: "telegram:dave" });
+    const nag = makeTickler({ title: "notify-no-roll-nag", due: c.due, recur: c.recur, nag: { every: "1h" }, notify: "telegram:dave" });
+    [oneOff, nag].forEach((t) => { createTickler(t); assert.equal(claimNotifyFire(t.id, null, c.due), true); });
+    assert.equal(getTickler(oneOff.id)!.status, "pending", "a one-off stays pending, as before");
+    assert.equal(listTicklers().filter((x) => x.title === "notify-no-roll-nag").length, 1, "a nag tickler gets no successor");
+  });
+
   test("ensureNotifyColumn backfills a pre-#11 schema, and old rows read back as agent", () => {
     const dbPath = tmpDbPath("migration-notify");
     // Pre-#11 schema: has recur and the nag columns, but no notify.

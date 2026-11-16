@@ -833,9 +833,15 @@ export function checkNotifyDue(now: string = new Date().toISOString()): Tickler[
  * the write side must too (round-1 code review, both reviewers independently).
  */
 export function claimNotifyFire(id: string, prevLastFiredAt: string | null, now: string): boolean {
-  const candidate = { id, lastFiredAt: prevLastFiredAt, nagFireCount: 0 } as Tickler;
-  const claimed = claimNagFire(candidate, now, "telegram:dave");
-  return claimed !== null;
+  return getDb().transaction((): boolean => {
+    const candidate = { id, lastFiredAt: prevLastFiredAt, nagFireCount: 0 } as Tickler;
+    if (claimNagFire(candidate, now, "telegram:dave") === null) return false;
+    // A recurring non-nag tickler fires once per occurrence, so the claim also rolls it to its
+    // next occurrence (same path as `completeTickler`). Nag rows and one-offs are unchanged.
+    const live = getTickler(id)!;
+    if (live.recur && !live.nag) completeTickler(id, now);
+    return true;
+  })();
 }
 
 /**
@@ -903,14 +909,13 @@ export interface CompleteResult {
  * completion and the successor insert run inside one `db.transaction()`, so a crash between
  * them can never leave a completed series with no next occurrence.
  */
-export function completeTickler(id: string): CompleteResult {
+export function completeTickler(id: string, now: string = new Date().toISOString()): CompleteResult {
   const db = getDb();
 
   const run = db.transaction((): CompleteResult => {
     const existing = getTickler(id);
     if (!existing) return { completed: false };
 
-    const now = new Date().toISOString();
     const result = db
       .prepare("UPDATE ticklers SET status = 'done', completed_at = @now WHERE id = @id AND status = 'pending'")
       .run({ id, now });
